@@ -510,6 +510,21 @@ def home():
     return render_template_string(INDEX_HTML, businesses=list_businesses())
 
 
+@app.route("/api/health")
+def health():
+    """فحص صحّة + نوع قاعدة البيانات (دون كشف أي أسرار)."""
+    backend = "turso" if os.environ.get("TURSO_DATABASE_URL") else "sqlite"
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return jsonify({"ok": db_ok, "backend": backend,
+                    "businesses": len(list_businesses()) if db_ok else None})
+
+
 @app.route("/b/<slug>")
 def booking_page(slug):
     biz = _biz_or_404(slug)

@@ -119,13 +119,23 @@ vercel deploy booking-site --prod --yes --scope <نطاق-حسابك>
 الكود جاهز (`wsgi.py` + `render.yaml` + `requirements-web.txt`)، ومسار القاعدة قابل للضبط عبر `BOOKING_DATA_DIR`.
 المستودع: `alharbib902-del/booking-system` (خاص). الخطوات:
 1. ادخل **render.com** → **New** → **Blueprint** → اربط GitHub → اختر مستودع `booking-system`.
-2. Render يقرأ `render.yaml` تلقائياً. اضبط متغيّرات البيئة عند الطلب:
+2. Render يقرأ `render.yaml` تلقائياً. اضبط متغيّرات البيئة:
    - `BOOKING_OWNER_PASSWORD` = كلمة مرور لوحة المالك.
+   - `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` = للتخزين الدائم (انظر أدناه).
    - `WASENDER_API_KEY` = (اختياري) لإشعارات واتساب.
 3. بعد النشر: `https://<اسم-الخدمة>.onrender.com/owner` (و `/b/<slug>` و `/admin/<slug>`).
 
-**الاستمرارية:** الخطة المجانية قرصها مؤقت (للتجربة فقط — تُفقد البيانات عند إعادة التشغيل). للإنتاج: غيّر `plan` إلى `starter` وفعّل القرص الدائم في `render.yaml` واضبط `BOOKING_DATA_DIR=/var/data`.
-> إدخال المنشآت للقاعدة السحابية يحتاج رفعها عبر لوحة المالك (ميزة قادمة) أو Render Shell — لأن `import` المحلي يكتب لقاعدة جهازك فقط.
+**التخزين الدائم مجاناً عبر Turso** (موصى به — يبقى مجانياً على Render):
+1. أنشئ حساباً مجانياً على **turso.tech**، ثم قاعدة بيانات:
+   ```bash
+   turso db create wajha
+   turso db show wajha --url            # → libsql://...   ضعه في TURSO_DATABASE_URL
+   turso db tokens create wajha         # → المفتاح        ضعه في TURSO_AUTH_TOKEN
+   ```
+2. أضِف المتغيّرين في Render (Environment) → أعِد النشر. تبقى كل البيانات محفوظة دائماً.
+> بدون متغيّرات Turso، يعمل النظام بقاعدة محلية مؤقتة (تُصفّر عند إعادة التشغيل — للتجربة فقط).
+
+**إدخال المنشآت:** من لوحة المالك → بطاقة **«📥 استيراد منشآت»** → ارفع ملف `output/*.json` الناتج من السحب.
 
 ### 👑 لوحة المالك (متابعة العملاء والاشتراكات)
 بعد `python booking_system.py run`، افتح **http://localhost:5001/owner**

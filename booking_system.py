@@ -518,11 +518,11 @@ def health():
         conn = get_db()
         conn.execute("SELECT 1").fetchone()
         conn.close()
-        db_ok = True
-    except Exception:
-        db_ok = False
-    return jsonify({"ok": db_ok, "backend": backend,
-                    "businesses": len(list_businesses()) if db_ok else None})
+        return jsonify({"ok": True, "backend": backend,
+                        "businesses": len(list_businesses())})
+    except Exception as e:
+        # نُرجع 200 مع تفاصيل الخطأ ليكون التشخيص ممكناً من المتصفح
+        return jsonify({"ok": False, "backend": backend, "error": str(e)[:300]})
 
 
 @app.route("/b/<slug>")

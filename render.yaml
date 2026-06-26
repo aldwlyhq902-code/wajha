@@ -14,7 +14,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements-web.txt
-    startCommand: gunicorn wsgi:app --workers 1 --threads 8 --timeout 120
+    startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
     envVars:
       - key: BOOKING_OWNER_PASSWORD   # كلمة مرور لوحة المالك
         sync: false

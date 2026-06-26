@@ -174,7 +174,14 @@ def get_db():
     turso = os.environ.get("TURSO_DATABASE_URL")
     if turso:
         import libsql_client
+        # استخدم نقل HTTPS بدل WebSocket (أكثر موثوقية على الاستضافات السحابية)
+        turso = turso.strip()
+        if turso.startswith("libsql://"):
+            turso = "https://" + turso[len("libsql://"):]
+        elif turso.startswith("wss://"):
+            turso = "https://" + turso[len("wss://"):]
         token = os.environ.get("TURSO_AUTH_TOKEN")
+        token = token.strip() if token else token
         client = (libsql_client.create_client_sync(url=turso, auth_token=token)
                   if token else libsql_client.create_client_sync(url=turso))
         return _LibsqlConn(client)
@@ -514,15 +521,16 @@ def home():
 def health():
     """فحص صحّة + نوع قاعدة البيانات (دون كشف أي أسرار)."""
     backend = "turso" if os.environ.get("TURSO_DATABASE_URL") else "sqlite"
+    info = {"backend": backend, "has_token": bool(os.environ.get("TURSO_AUTH_TOKEN"))}
     try:
         conn = get_db()
         conn.execute("SELECT 1").fetchone()
         conn.close()
-        return jsonify({"ok": True, "backend": backend,
-                        "businesses": len(list_businesses())})
+        info.update(ok=True, businesses=len(list_businesses()))
     except Exception as e:
         # نُرجع 200 مع تفاصيل الخطأ ليكون التشخيص ممكناً من المتصفح
-        return jsonify({"ok": False, "backend": backend, "error": str(e)[:300]})
+        info.update(ok=False, error=str(e)[:300])
+    return jsonify(info)
 
 
 @app.route("/b/<slug>")

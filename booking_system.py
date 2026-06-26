@@ -96,7 +96,88 @@ def detect_type(category: str) -> str:
 _book_lock = threading.Lock()
 
 
-def get_db() -> sqlite3.Connection:
+# --------------------------------------------------------------------------- #
+# طبقة الاتصال: SQLite محلي افتراضياً، أو Turso (libSQL) إن ضُبطت متغيّرات Turso #
+# تُحفظ البيانات دائماً في Turso (مناسب للاستضافة بلا قرص دائم مثل Render المجاني) #
+# --------------------------------------------------------------------------- #
+def _split_sql(script: str) -> list[str]:
+    return [s.strip() for s in script.split(";") if s.strip()]
+
+
+class _LibsqlCursor:
+    """واجهة شبيهة بمؤشّر sqlite3 فوق نتيجة libsql_client."""
+    def __init__(self, rs=None):
+        self._rows = list(rs.rows) if rs is not None else []
+        self.rowcount = getattr(rs, "rows_affected", -1) if rs is not None else -1
+        self.lastrowid = getattr(rs, "last_insert_rowid", None) if rs is not None else None
+        self._i = 0
+
+    def fetchone(self):
+        if self._i < len(self._rows):
+            r = self._rows[self._i]
+            self._i += 1
+            return r
+        return None
+
+    def fetchall(self):
+        rest = self._rows[self._i:]
+        self._i = len(self._rows)
+        return list(rest)
+
+    def __iter__(self):
+        return iter(self._rows[self._i:])
+
+
+class _LibsqlConn:
+    """واجهة شبيهة باتصال sqlite3 فوق عميل libsql_client (Turso).
+
+    صفوف libsql تدعم الوصول بالاسم والفهرس، فلا حاجة لـ row_factory.
+    كل عبارة تُنفَّذ تلقائياً (autocommit)؛ منع التعارض يبقى صحيحاً عبر _book_lock
+    لأن الخدمة تعمل بعملية واحدة (gunicorn --workers 1 + threads).
+    """
+    def __init__(self, client):
+        self._client = client
+
+    def execute(self, sql, params=()):
+        args = list(params) if params else None
+        rs = self._client.execute(sql, args) if args else self._client.execute(sql)
+        return _LibsqlCursor(rs)
+
+    def executescript(self, script):
+        stmts = _split_sql(script)
+        try:
+            self._client.batch(stmts)
+        except Exception:
+            for s in stmts:
+                self._client.execute(s)
+        return _LibsqlCursor(None)
+
+    def commit(self):
+        pass  # autocommit
+
+    def close(self):
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+    @property
+    def row_factory(self):
+        return None
+
+    @row_factory.setter
+    def row_factory(self, value):
+        pass  # غير مطلوب: صفوف libsql تدعم الوصول بالاسم أصلاً
+
+
+def get_db():
+    turso = os.environ.get("TURSO_DATABASE_URL")
+    if turso:
+        import libsql_client
+        token = os.environ.get("TURSO_AUTH_TOKEN")
+        client = (libsql_client.create_client_sync(url=turso, auth_token=token)
+                  if token else libsql_client.create_client_sync(url=turso))
+        return _LibsqlConn(client)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row

@@ -1,26 +1,26 @@
-# Render Blueprint — نشر نظام الحجز (Flask + SQLite)
+# Render Blueprint — نشر نظام الحجز (Flask)
 # الخطوات: Render.com → New → Blueprint → اربط مستودع GitHub → اختر هذا الملف.
 #
-# ملاحظة الاستمرارية:
-#   • الخطة المجانية (free): القرص مؤقت — تُفقد القاعدة عند كل إعادة تشغيل/نشر (للتجربة فقط).
-#   • للإنتاج: غيّر plan إلى starter، وفعّل القرص الدائم أدناه (disk)،
-#     واضبط BOOKING_DATA_DIR=/var/data ليُخزَّن booking.db على القرص الدائم.
+# التخزين الدائم (مجاناً) عبر Turso:
+#   1) أنشئ قاعدة Turso مجانية (turso.tech) واحصل على الرابط والمفتاح.
+#   2) اضبط في Render: TURSO_DATABASE_URL و TURSO_AUTH_TOKEN.
+#   ← عندها تبقى كل البيانات محفوظة حتى على خطة Render المجانية.
+#   (بدون هذين المتغيّرين يعمل النظام بقاعدة محلية مؤقتة تُصفّر عند إعادة التشغيل.)
+#
+# ملاحظة: عملية واحدة (--workers 1) ضرورية لصحة منع تعارض المواعيد (قفل داخل العملية).
 services:
   - type: web
     name: booking-system
     runtime: python
     plan: free
     buildCommand: pip install -r requirements-web.txt
-    startCommand: gunicorn wsgi:app
+    startCommand: gunicorn wsgi:app --workers 1 --threads 8 --timeout 120
     envVars:
-      - key: BOOKING_OWNER_PASSWORD   # كلمة مرور لوحة المالك (عيّنها في Render)
+      - key: BOOKING_OWNER_PASSWORD   # كلمة مرور لوحة المالك
+        sync: false
+      - key: TURSO_DATABASE_URL       # رابط قاعدة Turso (libsql://...) — للتخزين الدائم
+        sync: false
+      - key: TURSO_AUTH_TOKEN         # مفتاح Turso
         sync: false
       - key: WASENDER_API_KEY         # (اختياري) لإشعارات واتساب التلقائية
         sync: false
-      # للإنتاج مع قرص دائم، أزِل التعليق عن السطرين التاليين (يتطلّب plan: starter):
-      # - key: BOOKING_DATA_DIR
-      #   value: /var/data
-    # disk:
-    #   name: booking-data
-    #   mountPath: /var/data
-    #   sizeGB: 1

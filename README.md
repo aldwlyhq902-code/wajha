@@ -115,6 +115,18 @@ vercel deploy booking-site --prod --yes --scope <نطاق-حسابك>
 موقع حيّ حالياً: **https://booking-site-azure.vercel.app** (الصفحة لكل منشأة: `/<id>/`).
 > ⚠️ هذا للصفحات الثابتة فقط. **نظام الحجز الديناميكي (Flask+SQLite) لا يعمل على Vercel** (قرص مؤقت لا يحفظ القاعدة) — استضِفه على خادم دائم (Render/Railway) أو بقاعدة سحابية.
 
+### 🟣 نشر نظام الحجز الديناميكي على Render
+الكود جاهز (`wsgi.py` + `render.yaml` + `requirements-web.txt`)، ومسار القاعدة قابل للضبط عبر `BOOKING_DATA_DIR`.
+المستودع: `alharbib902-del/booking-system` (خاص). الخطوات:
+1. ادخل **render.com** → **New** → **Blueprint** → اربط GitHub → اختر مستودع `booking-system`.
+2. Render يقرأ `render.yaml` تلقائياً. اضبط متغيّرات البيئة عند الطلب:
+   - `BOOKING_OWNER_PASSWORD` = كلمة مرور لوحة المالك.
+   - `WASENDER_API_KEY` = (اختياري) لإشعارات واتساب.
+3. بعد النشر: `https://<اسم-الخدمة>.onrender.com/owner` (و `/b/<slug>` و `/admin/<slug>`).
+
+**الاستمرارية:** الخطة المجانية قرصها مؤقت (للتجربة فقط — تُفقد البيانات عند إعادة التشغيل). للإنتاج: غيّر `plan` إلى `starter` وفعّل القرص الدائم في `render.yaml` واضبط `BOOKING_DATA_DIR=/var/data`.
+> إدخال المنشآت للقاعدة السحابية يحتاج رفعها عبر لوحة المالك (ميزة قادمة) أو Render Shell — لأن `import` المحلي يكتب لقاعدة جهازك فقط.
+
 ### 👑 لوحة المالك (متابعة العملاء والاشتراكات)
 بعد `python booking_system.py run`، افتح **http://localhost:5001/owner**
 - كلمة المرور في `booking_data/.owner_pw` أو متغيّر `BOOKING_OWNER_PASSWORD`.

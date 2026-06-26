@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import math
 import os
@@ -704,47 +705,88 @@ def owner_update_sub(bid):
     return jsonify({"ok": ok}) if ok else (jsonify({"error": "منشأة غير موجودة"}), 404)
 
 
+@app.route("/api/owner/import", methods=["POST"])
+def owner_import():
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "ارفع ملف JSON الناتج من السحب (output/*.json)"}), 400
+    try:
+        data = json.loads(f.read().decode("utf-8"))
+    except Exception:
+        return jsonify({"error": "ملف JSON غير صالح"}), 400
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return jsonify({"error": "صيغة غير متوقعة (المتوقع قائمة منشآت)"}), 400
+    results = import_records(data, "966")
+    added = [r for r in results if r["added"]]
+    return jsonify({
+        "added": len(added),
+        "skipped": len(results) - len(added),
+        "businesses": [{"name": r["name"], "slug": r["slug"], "pin": r.get("pin")} for r in added],
+    })
+
+
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
-def cmd_import(args) -> None:
+def import_records(records, country: str = "966") -> list[dict]:
+    """يُدخل المنشآت للقاعدة (يتخطّى المكرّر). يُعيد [{name, slug, pin, added}].
+
+    تُستخدم من سطر الأوامر ومن لوحة المالك (رفع JSON) على حدٍ سواء.
+    """
     init_db()
+    conn = get_db()
+    out: list[dict] = []
+    try:
+        for r in records:
+            if not isinstance(r, dict) or not r.get("name"):
+                continue
+            fid = _feature_id(r.get("place_url", ""))
+            slug = _slugify(r.get("name", ""), fid)
+            exists = conn.execute(
+                "SELECT 1 FROM businesses WHERE slug=? OR (feature_id!='' AND feature_id=?)",
+                (slug, fid)).fetchone()
+            if exists:
+                out.append({"name": r.get("name", ""), "slug": slug, "added": False})
+                continue
+            intl = normalize_phone(r.get("phone"), country)
+            wa = intl if (intl and whatsappable(intl, r.get("phone"), country)) else ""
+            salt = secrets.token_hex(8)
+            pin = "%04d" % secrets.randbelow(10000)
+            today = date_cls.today().isoformat()
+            renews = (date_cls.today() + timedelta(days=14)).isoformat()  # تجربة 14 يوماً
+            conn.execute(
+                "INSERT INTO businesses(slug,feature_id,name,category,phone,whatsapp,address,"
+                "lat,lng,image_url,rating,reviews_count,booking_type,pin_hash,pin_salt,created_at,"
+                "plan,sub_status,monthly_fee,sub_started,sub_renews) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (slug, fid, r.get("name", ""), r.get("category", ""), r.get("phone", ""), wa,
+                 r.get("address", ""), r.get("latitude"), r.get("longitude"), r.get("image_url", ""),
+                 r.get("rating"), r.get("reviews_count"), detect_type(r.get("category", "")),
+                 _hash_pin(pin, salt), salt, datetime.now().isoformat(timespec="seconds"),
+                 "تجريبي", "trial", 0, today, renews),
+            )
+            out.append({"name": r.get("name", ""), "slug": slug, "pin": pin, "added": True})
+        conn.commit()
+    finally:
+        conn.close()
+    return out
+
+
+def cmd_import(args) -> None:
     records = load_records(args.input)
     if not records:
         print("❌ لا توجد سجلات في", args.input)
         return
-    conn = get_db()
-    added, skipped = 0, 0
-    for r in records:
-        fid = _feature_id(r.get("place_url", ""))
-        slug = _slugify(r.get("name", ""), fid)
-        exists = conn.execute("SELECT 1 FROM businesses WHERE slug=? OR (feature_id!='' AND feature_id=?)",
-                              (slug, fid)).fetchone()
-        if exists:
-            skipped += 1
-            continue
-        intl = normalize_phone(r.get("phone"), args.country)
-        wa = intl if (intl and whatsappable(intl, r.get("phone"), args.country)) else ""
-        salt = secrets.token_hex(8)
-        pin = "%04d" % secrets.randbelow(10000)
-        today = date_cls.today().isoformat()
-        renews = (date_cls.today() + timedelta(days=14)).isoformat()  # تجربة 14 يوماً
-        conn.execute(
-            "INSERT INTO businesses(slug,feature_id,name,category,phone,whatsapp,address,"
-            "lat,lng,image_url,rating,reviews_count,booking_type,pin_hash,pin_salt,created_at,"
-            "plan,sub_status,monthly_fee,sub_started,sub_renews) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (slug, fid, r.get("name", ""), r.get("category", ""), r.get("phone", ""), wa,
-             r.get("address", ""), r.get("latitude"), r.get("longitude"), r.get("image_url", ""),
-             r.get("rating"), r.get("reviews_count"), detect_type(r.get("category", "")),
-             _hash_pin(pin, salt), salt, datetime.now().isoformat(timespec="seconds"),
-             "تجريبي", "trial", 0, today, renews),
-        )
-        added += 1
-        print(f"  ✓ {r.get('name','')[:34]:<34} | /b/{slug}  | PIN: {pin}")
-    conn.commit()
-    conn.close()
-    print(f"\nتمت إضافة {added} منشأة (تجاهل {skipped} مكرّرة).")
+    results = import_records(records, args.country)
+    for r in results:
+        if r["added"]:
+            print(f"  ✓ {r['name'][:34]:<34} | /b/{r['slug']}  | PIN: {r['pin']}")
+    added = sum(1 for r in results if r["added"])
+    print(f"\nتمت إضافة {added} منشأة (تجاهل {len(results) - added} مكرّرة).")
     print("شغّل الخادم:  python booking_system.py run   ← ثم افتح http://localhost:5001")
 
 
@@ -1006,6 +1048,12 @@ input,select{padding:6px 8px;font-size:13px}
   <div class="kpi"><b>{{ total_bk }}</b>إجمالي الحجوزات</div>
   <div class="kpi"><b>{{ pending }}</b>بانتظار التأكيد</div>
 </div>
+<div class="card"><h2>📥 استيراد منشآت</h2>
+  <p class="muted" style="font-size:13px;margin-bottom:8px">ارفع ملف JSON الناتج من السحب (output/*.json). يُنشئ لكل منشأة رقم PIN لإدارتها.</p>
+  <input type="file" id="impfile" accept=".json,application/json" style="max-width:320px">
+  <button class="btn p" style="margin-inline-start:8px" onclick="doImport()">استيراد</button>
+  <div id="impres" style="margin-top:10px;font-size:14px"></div>
+</div>
 <div class="card"><h2>العملاء والاشتراكات</h2>
 <table><thead><tr><th>المنشأة</th><th>الباقة</th><th>الحالة</th><th>الرسوم/شهر</th><th>التجديد</th><th>الحجوزات</th><th></th></tr></thead><tbody>
 {% for r in rows %}
@@ -1036,6 +1084,26 @@ async function saveSub(id){
   const t=document.getElementById('toast');
   t.textContent=d.ok?'تم الحفظ ✓':('خطأ: '+(d.error||''));t.style.display='block';
   setTimeout(()=>t.style.display='none',1500);
+}
+function _esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function doImport(){
+  const fInput=document.getElementById('impfile'); const f=fInput.files[0];
+  if(!f){alert('اختر ملف JSON');return;}
+  const fd=new FormData(); fd.append('file', f);
+  const el=document.getElementById('impres'); el.textContent='جارٍ الاستيراد…';
+  try{
+    const r=await fetch('/api/owner/import',{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok){el.textContent='خطأ: '+(d.error||'');return;}
+    let html='✓ أُضيف '+d.added+' • تخطّي '+d.skipped+' (مكرّرة)';
+    if(d.businesses && d.businesses.length){
+      html+='<div class="muted" style="margin:6px 0">احفظ أرقام PIN لتسليمها للمنشآت:</div>';
+      html+='<table><tr><th>المنشأة</th><th>PIN</th><th>الرابط</th></tr>';
+      d.businesses.forEach(b=>{html+='<tr><td>'+_esc(b.name)+'</td><td><b>'+_esc(b.pin)+'</b></td><td>/b/'+_esc(b.slug)+'</td></tr>';});
+      html+='</table><div class="muted" style="margin-top:6px">حدّث الصفحة لرؤيتها في القائمة بالأسفل.</div>';
+    }
+    el.innerHTML=html;
+  }catch(e){el.textContent='تعذّر الاتصال بالخادم';}
 }
 </script></body></html>"""
 

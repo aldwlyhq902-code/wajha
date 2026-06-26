@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>سحب بيانات Google Maps</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<!-- ============ الشريط العلوي ============ -->
+<header class="topbar">
+  <div class="brand">
+    <span class="logo-dot red"></span>
+    <span class="logo-dot yellow"></span>
+    <span class="logo-dot green"></span>
+    <span class="logo-dot blue"></span>
+    <h1>سحب بيانات خرائط Google</h1>
+  </div>
+  <p class="muted">ابحث عن الأماكن، طبّق الفلاتر، وصدّر البيانات بصيغة JSON أو CSV</p>
+</header>
+
+<main class="container">
+
+  <!-- ============ نموذج البحث ============ -->
+  <section class="card" id="search-card">
+    <div class="tabs">
+      <button class="tab active" data-mode="search">🔍 بحث</button>
+      <button class="tab" data-mode="url">🔗 رابط موقع</button>
+      <button class="tab" data-mode="list">📋 قائمة</button>
+    </div>
+
+    <!-- وضع البحث -->
+    <div class="mode-panel" id="panel-search">
+      <div class="grid-3">
+        <div class="field">
+          <label>كلمة البحث</label>
+          <input type="text" id="keyword" placeholder="مثال: مطاعم، صيدليات، فنادق">
+        </div>
+        <div class="field">
+          <label>المدينة</label>
+          <input type="text" id="city" placeholder="مثال: القاهرة، الرياض، دبي">
+        </div>
+        <div class="field">
+          <label>عدد النتائج</label>
+          <input type="number" id="max" value="20" min="1" max="200">
+        </div>
+      </div>
+    </div>
+
+    <!-- وضع الرابط -->
+    <div class="mode-panel hidden" id="panel-url">
+      <div class="field">
+        <label>رابط الموقع على Google Maps</label>
+        <input type="text" id="url-input" placeholder="https://www.google.com/maps/place/...">
+      </div>
+    </div>
+
+    <!-- وضع القائمة -->
+    <div class="mode-panel hidden" id="panel-list">
+      <div class="field">
+        <label>قائمة الروابط أو الأسماء (سطر لكل عنصر)</label>
+        <textarea id="urls-input" rows="5" placeholder="https://www.google.com/maps/place/...&#10;أو اسم للبحث"></textarea>
+      </div>
+    </div>
+
+    <!-- خيارات متقدمة -->
+    <details class="advanced">
+      <summary>خيارات متقدمة</summary>
+      <div class="grid-3">
+        <div class="field">
+          <label>اللغة</label>
+          <select id="lang">
+            <option value="ar">العربية</option>
+            <option value="en">English</option>
+            <option value="fr">Français</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>بروكسي (اختياري)</label>
+          <input type="text" id="proxy" placeholder="server=host:port;username=u;password=p">
+        </div>
+        <div class="field checkbox-field">
+          <label><input type="checkbox" id="headless" checked> متصفح مخفي</label>
+        </div>
+      </div>
+    </details>
+
+    <div class="actions">
+      <button class="btn primary" id="btn-search">ابدأ السحب</button>
+    </div>
+  </section>
+
+  <!-- ============ حالة التقدّم ============ -->
+  <section class="card hidden" id="progress-card">
+    <div class="progress-wrap">
+      <div class="spinner"></div>
+      <div>
+        <h3 id="progress-text">جارٍ السحب... قد يستغرق هذا بعض الوقت</h3>
+        <p class="muted" id="progress-count"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ الفلاتر + النتائج ============ -->
+  <section class="card hidden" id="results-card">
+    <div class="results-header">
+      <h2>النتائج (<span id="result-count">0</span>)</h2>
+      <div class="export-buttons">
+        <button class="btn ghost" id="btn-json">⬇ تصدير JSON</button>
+        <button class="btn ghost" id="btn-csv">⬇ تصدير CSV</button>
+        <button class="btn ghost" id="btn-clear">✕ مسح</button>
+      </div>
+    </div>
+
+    <!-- الفلاتر -->
+    <div class="filters">
+      <div class="field">
+        <label>بحث في النتائج</label>
+        <input type="text" id="filter-text" placeholder="فلترة بالاسم أو العنوان...">
+      </div>
+      <div class="field">
+        <label>أقل تقييم</label>
+        <select id="filter-rating">
+          <option value="0">الكل</option>
+          <option value="3">3 نجوم فأكثر</option>
+          <option value="4">4 نجوم فأكثر</option>
+          <option value="4.5">4.5 نجوم فأكثر</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>التصنيف</label>
+        <select id="filter-category"><option value="">الكل</option></select>
+      </div>
+      <div class="field">
+        <label>حالة الفتح</label>
+        <select id="filter-open">
+          <option value="">الكل</option>
+          <option value="open">مفتوح فقط</option>
+          <option value="closed">مغلق فقط</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>نطاق السعر</label>
+        <select id="filter-price"><option value="">الكل</option></select>
+      </div>
+    </div>
+
+    <!-- الجدول -->
+    <div class="table-wrap">
+      <table id="results-table">
+        <thead>
+          <tr>
+            <th>صورة</th>
+            <th data-sort="name">الاسم ⇅</th>
+            <th data-sort="category">التصنيف ⇅</th>
+            <th data-sort="rating">التقييم ⇅</th>
+            <th data-sort="reviews_count">المراجعات ⇅</th>
+            <th>الهاتف</th>
+            <th>العنوان</th>
+            <th>الحالة</th>
+            <th>الموقع</th>
+            <th>رابط</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <p class="muted small">⚠️ الكشط الآلي قد يخالف شروط خدمة Google — للاستخدام التعليمي والبحثي.</p>
+</footer>
+
+<script>
+// ====================================================================
+// حالة التطبيق
+// ====================================================================
+let ALL_RESULTS = [];
+let FILTERED = [];
+let SORT_KEY = null;
+let SORT_ASC = true;
+let CURRENT_MODE = "search";
+let POLL_TIMER = null;
+
+// ====================================================================
+// تبديل أوضاع البحث
+// ====================================================================
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    CURRENT_MODE = tab.dataset.mode;
+    document.querySelectorAll(".mode-panel").forEach(p => p.classList.add("hidden"));
+    document.getElementById("panel-" + CURRENT_MODE).classList.remove("hidden");
+  });
+});
+
+// ====================================================================
+// بدء السحب
+// ====================================================================
+document.getElementById("btn-search").addEventListener("click", startSearch);
+
+async function startSearch() {
+  const payload = {
+    mode: CURRENT_MODE,
+    lang: document.getElementById("lang").value,
+    proxy: document.getElementById("proxy").value.trim(),
+    headless: document.getElementById("headless").checked,
+  };
+
+  if (CURRENT_MODE === "search") {
+    payload.keyword = document.getElementById("keyword").value.trim();
+    payload.city = document.getElementById("city").value.trim();
+    payload.max = parseInt(document.getElementById("max").value) || 20;
+    if (!payload.keyword) { alert("أدخل كلمة البحث"); return; }
+  } else if (CURRENT_MODE === "url") {
+    payload.url = document.getElementById("url-input").value.trim();
+    if (!payload.url) { alert("أدخل الرابط"); return; }
+  } else {
+    payload.urls = document.getElementById("urls-input").value;
+    if (!payload.urls.trim()) { alert("الصق قائمة الروابط/الأسماء"); return; }
+  }
+
+  // أوقف أي استطلاع سابق وامسح حالة الفلاتر القديمة
+  if (POLL_TIMER) { clearInterval(POLL_TIMER); POLL_TIMER = null; }
+  resetUI();
+  document.getElementById("progress-count").textContent = "";
+
+  // عرض شاشة التقدّم
+  document.getElementById("results-card").classList.add("hidden");
+  document.getElementById("progress-card").classList.remove("hidden");
+  const btn = document.getElementById("btn-search");
+  btn.disabled = true;
+  btn.textContent = "جارٍ...";
+
+  try {
+    const resp = await fetch("/api/search", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      alert("خطأ: " + (data.error || "غير معروف"));
+      stopProgress();
+      return;
+    }
+    pollStatus(data.job_id);
+  } catch (e) {
+    alert("فشل الاتصال بالخادم: " + e.message);
+    stopProgress();
+  }
+}
+
+// ====================================================================
+// استطلاع حالة المهمة
+// ====================================================================
+function pollStatus(jobId) {
+  if (POLL_TIMER) { clearInterval(POLL_TIMER); POLL_TIMER = null; }
+  const startTs = Date.now();
+  const MAX_MS = 15 * 60 * 1000;     // سقف زمني صلب: 15 دقيقة
+  let errCount = 0;
+  const MAX_ERRORS = 20;             // ~30 ثانية من الأخطاء المتتالية
+
+  POLL_TIMER = setInterval(async () => {
+    if (Date.now() - startTs > MAX_MS) {
+      clearInterval(POLL_TIMER); POLL_TIMER = null;
+      stopProgress();
+      alert("انتهت مهلة السحب. حاول مرة أخرى.");
+      return;
+    }
+    try {
+      const resp = await fetch("/api/status/" + jobId);
+      const data = await resp.json();
+      if (!resp.ok) {
+        clearInterval(POLL_TIMER); POLL_TIMER = null;
+        stopProgress();
+        alert("خطأ: " + (data.error || "غير معروف"));
+        return;
+      }
+      errCount = 0;
+      const prog = data.progress || {};
+      const cnt = document.getElementById("progress-count");
+      if (data.status === "running") {
+        if (prog.total) cnt.textContent = `${prog.current || 0} / ${prog.total} موقع`;
+        else cnt.textContent = "جارٍ تجهيز النتائج...";
+      }
+      if (data.status === "done") {
+        clearInterval(POLL_TIMER); POLL_TIMER = null;
+        stopProgress();
+        ALL_RESULTS = data.results || [];
+        buildFiltersFromResults();
+        renderResults();
+        document.getElementById("results-card").classList.remove("hidden");
+      } else if (data.status === "error") {
+        clearInterval(POLL_TIMER); POLL_TIMER = null;
+        stopProgress();
+        alert("فشل السحب: " + (data.error || "خطأ غير معروف"));
+      }
+    } catch (e) {
+      if (++errCount >= MAX_ERRORS) {
+        clearInterval(POLL_TIMER); POLL_TIMER = null;
+        stopProgress();
+        alert("تعذّر الاتصال بالخادم لمتابعة الحالة.");
+      }
+    }
+  }, 1500);
+}
+
+function stopProgress() {
+  document.getElementById("progress-card").classList.add("hidden");
+  const btn = document.getElementById("btn-search");
+  btn.disabled = false;
+  btn.textContent = "ابدأ السحب";
+}
+
+// ====================================================================
+// بناء قوائم الفلاتر من النتائج
+// ====================================================================
+function buildFiltersFromResults() {
+  // التصنيفات
+  const cats = [...new Set(ALL_RESULTS.map(r => r.category).filter(Boolean))].sort();
+  const catSel = document.getElementById("filter-category");
+  catSel.innerHTML = '<option value="">الكل</option>' +
+    cats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+
+  // نطاقات الأسعار
+  const prices = [...new Set(ALL_RESULTS.map(r => r.price_range).filter(Boolean))].sort();
+  const priceSel = document.getElementById("filter-price");
+  priceSel.innerHTML = '<option value="">الكل</option>' +
+    prices.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join("");
+}
+
+// ====================================================================
+// تطبيق الفلاتر
+// ====================================================================
+["filter-text","filter-rating","filter-category","filter-open","filter-price"]
+  .forEach(id => document.getElementById(id).addEventListener("input", renderResults));
+
+function applyFilters() {
+  const text = document.getElementById("filter-text").value.trim().toLowerCase();
+  const minRating = parseFloat(document.getElementById("filter-rating").value);
+  const cat = document.getElementById("filter-category").value;
+  const open = document.getElementById("filter-open").value;
+  const price = document.getElementById("filter-price").value;
+
+  FILTERED = ALL_RESULTS.filter(r => {
+    if (text) {
+      const hay = (r.name + " " + r.address + " " + r.phone).toLowerCase();
+      if (!hay.includes(text)) return false;
+    }
+    if (!isNaN(minRating) && minRating > 0) {
+      if ((r.rating || 0) < minRating) return false;
+    }
+    if (cat && r.category !== cat) return false;
+    if (price && r.price_range !== price) return false;
+    if (open) {
+      const o = (r.is_open_now || "").toLowerCase();
+      const isOpen = o.includes("مفتوح") || o.includes("open");
+      const isClosed = o.includes("مغلق") || o.includes("closed");
+      if (open === "open" && !isOpen) return false;
+      if (open === "closed" && !isClosed) return false;
+    }
+    return true;
+  });
+
+  if (SORT_KEY) doSort();
+}
+
+// ====================================================================
+// الفرز
+// ====================================================================
+document.querySelectorAll("th[data-sort]").forEach(th => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.sort;
+    if (SORT_KEY === key) { SORT_ASC = !SORT_ASC; }
+    else { SORT_KEY = key; SORT_ASC = false; }
+    renderResults();
+  });
+});
+
+function doSort() {
+  if (!SORT_KEY) return;
+  FILTERED.sort((a, b) => {
+    let va = a[SORT_KEY], vb = b[SORT_KEY];
+    va = va ?? -1; vb = vb ?? -1;
+    if (typeof va === "string") va = va.toLowerCase();
+    if (typeof vb === "string") vb = vb.toLowerCase();
+    if (va < vb) return SORT_ASC ? -1 : 1;
+    if (va > vb) return SORT_ASC ? 1 : -1;
+    return 0;
+  });
+}
+
+// ====================================================================
+// عرض النتائج
+// ====================================================================
+function renderResults() {
+  applyFilters();
+  const body = document.getElementById("results-body");
+  document.getElementById("result-count").textContent = FILTERED.length;
+
+  if (FILTERED.length === 0) {
+    body.innerHTML = '<tr><td colspan="10" class="empty">لا توجد نتائج مطابقة</td></tr>';
+    return;
+  }
+
+  body.innerHTML = FILTERED.map(r => {
+    const img = r.image_url
+      ? `<img class="thumb" src="${esc(safeUrl(r.image_url))}" loading="lazy" onerror="this.style.display='none'">`
+      : '<span class="no-img">—</span>';
+    const stars = r.rating ? `⭐ ${r.rating}` : "—";
+    const reviews = r.reviews_count != null ? r.reviews_count.toLocaleString("ar") : "—";
+    const openCls = isOpenNow(r) ? "badge open" : (isClosedNow(r) ? "badge closed" : "badge");
+    const openTxt = r.is_open_now ? r.is_open_now.split("·")[0].trim() : "—";
+    const mapLink = (r.latitude && r.longitude)
+      ? `<a class="mini" href="https://www.google.com/maps/@${r.latitude},${r.longitude},17z" target="_blank">🗺️ خريطة</a>`
+      : "—";
+    const placeLink = r.place_url
+      ? `<a class="mini" href="${esc(safeUrl(r.place_url))}" target="_blank">فتح ↗</a>`
+      : "—";
+    const phone = r.phone ? `<a class="mini" href="tel:${esc(r.phone)}">${esc(r.phone)}</a>` : "—";
+    // خلية الاسم: الاسم هو النص الظاهر (مرتبط بالموقع إن وُجد) ونطاق الموقع كسطر فرعي
+    const nameCell = r.website
+      ? `<a class="mini" href="${esc(safeUrl(r.website))}" target="_blank">${esc(r.name || '—')}</a>` +
+        `<div class="sub">${esc(hostname(r.website))}</div>`
+      : esc(r.name || "—");
+
+    return `<tr>
+      <td>${img}</td>
+      <td><strong>${nameCell}</strong></td>
+      <td>${esc(r.category || "—")}</td>
+      <td>${stars}</td>
+      <td>${reviews}</td>
+      <td>${phone}</td>
+      <td class="addr">${esc(r.address || "—")}</td>
+      <td><span class="${openCls}">${esc(openTxt)}</span></td>
+      <td>${mapLink}</td>
+      <td>${placeLink}</td>
+    </tr>`;
+  }).join("");
+}
+
+function isOpenNow(r) {
+  const o = (r.is_open_now || "").toLowerCase();
+  return o.includes("مفتوح") || o.includes("open");
+}
+function isClosedNow(r) {
+  const o = (r.is_open_now || "").toLowerCase();
+  return o.includes("مغلق") || o.includes("closed");
+}
+
+// ====================================================================
+// التصدير
+// ====================================================================
+document.getElementById("btn-json").addEventListener("click", () => exportData("json"));
+document.getElementById("btn-csv").addEventListener("click", () => exportData("csv"));
+document.getElementById("btn-clear").addEventListener("click", () => {
+  ALL_RESULTS = []; FILTERED = [];
+  resetUI();
+  document.getElementById("results-card").classList.add("hidden");
+});
+
+// أعد ضبط حالة الفرز والفلاتر حتى لا تتسرّب إلى بحث جديد
+function resetUI() {
+  SORT_KEY = null; SORT_ASC = true;
+  document.getElementById("filter-text").value = "";
+  document.getElementById("filter-rating").value = "0";
+  document.getElementById("filter-open").value = "";
+  document.getElementById("filter-category").value = "";
+  document.getElementById("filter-price").value = "";
+  document.getElementById("result-count").textContent = "0";
+}
+
+function exportData(fmt) {
+  applyFilters();
+  if (FILTERED.length === 0) { alert("لا توجد بيانات للتصدير"); return; }
+  const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,"-");
+
+  if (fmt === "json") {
+    const blob = new Blob([JSON.stringify(FILTERED, null, 2)], {type: "application/json;charset=utf-8"});
+    downloadBlob(blob, `gmaps_${stamp}.json`);
+  } else {
+    const keys = Object.keys(FILTERED[0]);
+    const rows = [keys.map(csvCell).join(",")];
+    FILTERED.forEach(r => {
+      rows.push(keys.map(k => {
+        let v = r[k];
+        if (Array.isArray(v)) v = v.join(" | ");
+        return csvCell(v);
+      }).join(","));
+    });
+    // CRLF + BOM \u0644\u0644\u062A\u0648\u0627\u0641\u0642 \u0645\u0639 Excel
+    const blob = new Blob(["\uFEFF" + rows.join("\r\n")], {type: "text/csv;charset=utf-8"});
+    downloadBlob(blob, `gmaps_${stamp}.csv`);
+  }
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+// ====================================================================
+// أدوات
+// ====================================================================
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
+// اسمح فقط بأنواع روابط آمنة (يمنع javascript:/data: XSS)
+function safeUrl(u) {
+  u = String(u == null ? "" : u).trim();
+  return /^(https?:|tel:|mailto:)/i.test(u) ? u : "#";
+}
+
+// اسم النطاق من رابط (للعرض المختصر)
+function hostname(u) {
+  try { return new URL(u).hostname.replace(/^www\./, ""); }
+  catch (e) { return u; }
+}
+
+// خلية CSV آمنة: يمنع حقن الصيغ ويقتبس عند الحاجة
+function csvCell(v) {
+  v = String(v == null ? "" : v);
+  if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;            // تحييد حقن الصيغ في Excel
+  if (/[",\n\r]/.test(v)) v = '"' + v.replace(/"/g, '""') + '"';
+  return v;
+}
+</script>
+
+</body>
+</html>

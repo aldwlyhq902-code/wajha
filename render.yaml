@@ -1,0 +1,26 @@
+# Render Blueprint — نشر نظام الحجز (Flask + SQLite)
+# الخطوات: Render.com → New → Blueprint → اربط مستودع GitHub → اختر هذا الملف.
+#
+# ملاحظة الاستمرارية:
+#   • الخطة المجانية (free): القرص مؤقت — تُفقد القاعدة عند كل إعادة تشغيل/نشر (للتجربة فقط).
+#   • للإنتاج: غيّر plan إلى starter، وفعّل القرص الدائم أدناه (disk)،
+#     واضبط BOOKING_DATA_DIR=/var/data ليُخزَّن booking.db على القرص الدائم.
+services:
+  - type: web
+    name: booking-system
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-web.txt
+    startCommand: gunicorn wsgi:app
+    envVars:
+      - key: BOOKING_OWNER_PASSWORD   # كلمة مرور لوحة المالك (عيّنها في Render)
+        sync: false
+      - key: WASENDER_API_KEY         # (اختياري) لإشعارات واتساب التلقائية
+        sync: false
+      # للإنتاج مع قرص دائم، أزِل التعليق عن السطرين التاليين (يتطلّب plan: starter):
+      # - key: BOOKING_DATA_DIR
+      #   value: /var/data
+    # disk:
+    #   name: booking-data
+    #   mountPath: /var/data
+    #   sizeGB: 1

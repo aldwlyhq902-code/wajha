@@ -1,0 +1,20 @@
+# أسرار وبيانات محلية — لا تُرفع إطلاقاً
+booking_data/
+output/
+wasender.key
+*.db
+.secret
+.owner_pw
+.wasender_key
+
+# مخرجات بناء/نشر
+site/
+booking-site/
+.vercel/
+
+# مؤقتات Python
+__pycache__/
+*.pyc
+
+# صور تشخيص كبيرة
+*.png

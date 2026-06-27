@@ -34,17 +34,37 @@
     <div class="mode-panel" id="panel-search">
       <div class="grid-3">
         <div class="field">
-          <label>كلمة البحث</label>
-          <input type="text" id="keyword" placeholder="مثال: مطاعم، صيدليات، فنادق">
+          <label>الدولة</label>
+          <select id="country"></select>
         </div>
         <div class="field">
           <label>المدينة</label>
-          <input type="text" id="city" placeholder="مثال: القاهرة، الرياض، دبي">
+          <input type="text" id="city" list="city-list" placeholder="اختر أو اكتب المدينة">
+          <datalist id="city-list"></datalist>
+        </div>
+        <div class="field">
+          <label>الحي (اختياري)</label>
+          <input type="text" id="neighborhood" list="hood-list" placeholder="مثال: العليا، الروضة">
+          <datalist id="hood-list"></datalist>
+        </div>
+      </div>
+      <div class="grid-3" style="margin-top:14px">
+        <div class="field">
+          <label>النشاط</label>
+          <input type="text" id="keyword" list="act-list" placeholder="مثال: صالونات، مطاعم، عيادات">
+          <datalist id="act-list">
+            <option value="صالونات تجميل"><option value="صالونات حلاقة"><option value="مطاعم">
+            <option value="كافيهات"><option value="عيادات"><option value="عيادات أسنان">
+            <option value="صيدليات"><option value="فنادق"><option value="مغاسل ملابس">
+            <option value="ورش سيارات"><option value="مغاسل سيارات"><option value="نوادي رياضية">
+            <option value="عقارات"><option value="بقالات"><option value="مستشفيات">
+          </datalist>
         </div>
         <div class="field">
           <label>عدد النتائج</label>
           <input type="number" id="max" value="20" min="1" max="200">
         </div>
+        <div class="field"></div>
       </div>
     </div>
 
@@ -210,6 +230,59 @@ document.querySelectorAll(".tab").forEach(tab => {
 });
 
 // ====================================================================
+// البحث المتدرّج: الدولة ← المدينة ← الحي
+// ====================================================================
+const GEO = {
+  "السعودية": ["الرياض","جدة","مكة المكرمة","المدينة المنورة","الدمام","الخبر","الظهران","الطائف","تبوك","أبها","خميس مشيط","بريدة","عنيزة","الأحساء","الهفوف","حائل","نجران","جازان","ينبع","الجبيل"],
+  "الإمارات": ["دبي","أبوظبي","الشارقة","العين","عجمان","رأس الخيمة","الفجيرة","أم القيوين"],
+  "الكويت": ["مدينة الكويت","حولي","الفروانية","الأحمدي","الجهراء","مبارك الكبير"],
+  "قطر": ["الدوحة","الريان","الوكرة","الخور","لوسيل","الوكير"],
+  "البحرين": ["المنامة","المحرق","الرفاع","مدينة عيسى","مدينة حمد","سترة"],
+  "عُمان": ["مسقط","صلالة","صحار","نزوى","صور","البريمي","عبري"],
+  "مصر": ["القاهرة","الجيزة","الإسكندرية","المنصورة","طنطا","أسيوط","الزقازيق","المنصورة","شرم الشيخ","الغردقة"],
+  "الأردن": ["عمّان","الزرقاء","إربد","العقبة","المفرق","السلط"],
+  "العراق": ["بغداد","البصرة","الموصل","أربيل","النجف","كربلاء","السليمانية"],
+  "المغرب": ["الدار البيضاء","الرباط","مراكش","فاس","طنجة","أكادير","مكناس"],
+  "الجزائر": ["الجزائر","وهران","قسنطينة","عنابة"],
+  "تونس": ["تونس","صفاقس","سوسة","المنستير"],
+  "أخرى": []
+};
+const HOODS = {
+  "الرياض": ["العليا","الملز","النخيل","الياسمين","الملقا","حطين","المروج","الورود","السليمانية","النرجس","قرطبة","الربوة","العقيق","الروضة","النزهة","المغرزات","الصحافة","غرناطة","الخليج"],
+  "جدة": ["الروضة","الزهراء","السلامة","الحمراء","الشاطئ","النعيم","المرجان","أبحر الشمالية","البساتين","الصفا","الفيصلية","الأندلس","النهضة","الرحاب","السامر"],
+  "الدمام": ["الشاطئ","الفيصلية","النورس","الجلوية","الأمل","الروضة","أحد","الفنار","الندى"],
+  "مكة المكرمة": ["العزيزية","الششة","النسيم","الزاهر","الشوقية","العوالي","المعابدة"],
+  "دبي": ["ديرة","بر دبي","الكرامة","البرشاء","الجميرا","مردف","القصيص","المركز التجاري","الخليج التجاري"],
+  "أبوظبي": ["المرور","الخالدية","النادي السياحي","المصفح","الكورنيش","الريم","الباهية"],
+  "الدوحة": ["الوعب","الساد","الدفنة","الغرافة","المنصورة","النصر","بن محمود"],
+  "القاهرة": ["مدينة نصر","المعادي","مصر الجديدة","الزمالك","المهندسين","المقطم","التجمع الخامس","الدقي","حلوان"]
+};
+
+function _fillList(elId, items){
+  document.getElementById(elId).innerHTML = (items||[]).map(v => `<option value="${esc(v)}">`).join("");
+}
+function _fillSelect(elId, items){
+  document.getElementById(elId).innerHTML =
+    '<option value="">— اختر —</option>' + (items||[]).map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+}
+(function initGeo(){
+  const countrySel = document.getElementById("country");
+  countrySel.innerHTML = '<option value="">— اختر الدولة —</option>' +
+    Object.keys(GEO).map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  // افتراضياً السعودية
+  countrySel.value = "السعودية";
+  _fillList("city-list", GEO["السعودية"]);
+  countrySel.addEventListener("change", () => {
+    _fillList("city-list", GEO[countrySel.value] || []);
+    document.getElementById("city").value = "";
+    _fillList("hood-list", []);
+  });
+  document.getElementById("city").addEventListener("input", () => {
+    _fillList("hood-list", HOODS[document.getElementById("city").value.trim()] || []);
+  });
+})();
+
+// ====================================================================
 // بدء السحب
 // ====================================================================
 document.getElementById("btn-search").addEventListener("click", startSearch);
@@ -223,10 +296,16 @@ async function startSearch() {
   };
 
   if (CURRENT_MODE === "search") {
-    payload.keyword = document.getElementById("keyword").value.trim();
-    payload.city = document.getElementById("city").value.trim();
+    const activity = document.getElementById("keyword").value.trim();
+    const country = document.getElementById("country").value.trim();
+    const city = document.getElementById("city").value.trim();
+    const hood = document.getElementById("neighborhood").value.trim();
+    if (!activity) { alert("أدخل النشاط"); return; }
+    if (!city && !country) { alert("اختر الدولة والمدينة"); return; }
+    payload.keyword = activity;
+    // الموقع المركّب: الحي، المدينة، الدولة (يُتجاهل الفارغ)
+    payload.city = [hood, city, country].filter(Boolean).join("، ");
     payload.max = parseInt(document.getElementById("max").value) || 20;
-    if (!payload.keyword) { alert("أدخل كلمة البحث"); return; }
   } else if (CURRENT_MODE === "url") {
     payload.url = document.getElementById("url-input").value.trim();
     if (!payload.url) { alert("أدخل الرابط"); return; }
@@ -485,6 +564,11 @@ document.getElementById("btn-clear").addEventListener("click", () => {
   k.value = localStorage.getItem("owner_key") || "";
   u.addEventListener("change", () => localStorage.setItem("cloud_url", u.value.trim()));
   k.addEventListener("change", () => localStorage.setItem("owner_key", k.value.trim()));
+  // املأ تلقائياً من إعداد الخادم المحلي (booking_data/cloud.json) إن وُجد
+  fetch("/api/cloud_config").then(r => r.json()).then(c => {
+    if (!u.value && c.cloud_url) u.value = c.cloud_url;
+    if (c.has_key && !k.value) k.placeholder = "محفوظ تلقائياً ✓ (لا حاجة للكتابة)";
+  }).catch(() => {});
 })();
 
 document.getElementById("btn-cloud").addEventListener("click", saveToCloud);
@@ -492,14 +576,11 @@ document.getElementById("btn-cloud").addEventListener("click", saveToCloud);
 async function saveToCloud() {
   applyFilters();
   if (FILTERED.length === 0) { alert("لا توجد بيانات للحفظ"); return; }
+  // الحقول اختيارية: إن تُركت فارغة يستخدم الخادم المحلي إعداد cloud.json
   const cloud_url = document.getElementById("cloud-url").value.trim();
   const owner_key = document.getElementById("owner-key").value.trim();
-  if (!cloud_url || !owner_key) {
-    alert("أدخل رابط النظام السحابي وكلمة مرور المالك في «خيارات متقدمة».");
-    return;
-  }
-  localStorage.setItem("cloud_url", cloud_url);
-  localStorage.setItem("owner_key", owner_key);
+  if (cloud_url) localStorage.setItem("cloud_url", cloud_url);
+  if (owner_key) localStorage.setItem("owner_key", owner_key);
   const btn = document.getElementById("btn-cloud");
   const orig = btn.textContent; btn.disabled = true; btn.textContent = "جارٍ الحفظ...";
   try {
@@ -509,12 +590,15 @@ async function saveToCloud() {
     });
     const d = await resp.json();
     if (!resp.ok) { alert("تعذّر الحفظ: " + (d.error || "خطأ")); return; }
+    // افتح موقع نظام الحجز تلقائياً بعد الحفظ
+    const site = (d.cloud_url || cloud_url || "").replace(/\/$/, "");
+    if (site) window.open(site + "/owner", "_blank");
     let msg = `✓ حُفظ في القاعدة: أُضيف ${d.added} • تخطّي ${d.skipped} (مكرّرة)`;
     if (d.businesses && d.businesses.length) {
       msg += "\n\nأرقام PIN (احفظها لتسليمها للمنشآت):\n" +
         d.businesses.map(b => `• ${b.name} — PIN ${b.pin}`).join("\n");
     }
-    alert(msg);
+    alert(msg + "\n\n(فُتح موقع النظام في تبويب جديد)");
   } catch (e) {
     alert("فشل الاتصال بالخادم المحلي: " + e.message);
   } finally {

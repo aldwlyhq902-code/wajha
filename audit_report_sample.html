@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>تقرير تدقيق موقع مطعم الذوق الرفيع — واجهة</title>
+<style>
+  :root{ --brand:#128C7E; --green:#25D366; --ink:#0f172a; --muted:#64748b;
+          --bg:#f1f5f9; --card:#ffffff; --line:#e2e8f0; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; font-family:"Segoe UI",Tahoma,system-ui,sans-serif;
+         background:var(--bg); color:var(--ink); line-height:1.7; }
+  .wrap{ max-width:860px; margin:0 auto; padding:20px; }
+  .top{ background:linear-gradient(135deg,var(--brand),#0d6e63);
+         color:#fff; border-radius:18px; padding:26px; margin-bottom:18px;
+         box-shadow:0 10px 30px rgba(18,140,126,.25); }
+  .top .brand{ font-weight:800; letter-spacing:.5px; opacity:.95; }
+  .top h1{ margin:6px 0 4px; font-size:26px; }
+  .top .site{ font-size:14px; opacity:.9; word-break:break-all; }
+  .top .site a{ color:#d1fae5; }
+  .card{ background:var(--card); border:1px solid var(--line);
+          border-radius:16px; padding:22px; margin-bottom:16px;
+          box-shadow:0 4px 14px rgba(15,23,42,.04); }
+  h2{ font-size:19px; margin:0 0 14px; color:var(--brand); }
+  h3{ font-size:16px; margin:0 0 8px; }
+  .score-card{ display:flex; align-items:center; gap:24px; flex-wrap:wrap; }
+  .ring{ flex:0 0 auto; }
+  .ring .num{ font-size:34px; font-weight:800; }
+  .score-meta{ flex:1 1 240px; }
+  .score-meta .lbl{ display:inline-block; padding:5px 14px; border-radius:999px;
+        font-weight:700; color:#fff; font-size:14px; }
+  .dim{ margin:12px 0; }
+  .dim-head{ display:flex; justify-content:space-between; font-size:14px;
+        font-weight:600; margin-bottom:5px; }
+  .dim-val{ font-weight:800; }
+  .bar{ background:#eef2f7; border-radius:999px; height:10px; overflow:hidden; }
+  .bar i{ display:block; height:100%; border-radius:999px; transition:width .4s; }
+  ul{ margin:6px 0; padding-inline-start:22px; }
+  li{ margin:6px 0; }
+  .good li::marker{ color:var(--green); }
+  .bad li::marker{ color:#dc2626; }
+  .phase{ border-inline-start:4px solid var(--brand); background:#f8fafc;
+        border-radius:0 12px 12px 0; padding:12px 16px; margin:12px 0; }
+  .phase-top{ display:flex; justify-content:space-between; align-items:center; }
+  .phase-top h4{ margin:0; color:var(--ink); font-size:15px; }
+  .when{ font-size:12px; color:var(--muted); background:#e2e8f0;
+        padding:3px 10px; border-radius:999px; }
+  .offers{ display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .offer{ border:1px solid var(--line); border-radius:14px; padding:18px;
+        background:linear-gradient(180deg,#fff,#f8fffd); }
+  .offer .pill{ display:inline-block; background:var(--green); color:#063;
+        font-weight:800; font-size:12px; padding:3px 10px; border-radius:999px;
+        margin-bottom:8px; }
+  .offer h3{ color:var(--brand); }
+  .offer p{ color:var(--muted); font-size:14px; margin:6px 0 0; }
+  .cta{ text-align:center; margin:24px 0 10px; }
+  .btn{ display:inline-flex; align-items:center; gap:10px; background:var(--green);
+        color:#053d2b; text-decoration:none; font-weight:800; font-size:18px;
+        padding:16px 34px; border-radius:14px;
+        box-shadow:0 8px 22px rgba(37,211,102,.4); }
+  .btn:hover{ filter:brightness(1.05); }
+  .foot{ text-align:center; color:var(--muted); font-size:12px; margin-top:18px; }
+  @media(max-width:560px){ .offers{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <div class="brand">واجهة · تقرير تدقيق رقمي</div>
+    <h1>مطعم الذوق الرفيع</h1>
+    <div class="site">الموقع المفحوص: <a href="https://example.com" target="_blank" rel="noopener">https://example.com</a></div>
+  </div>
+
+  <div class="card score-card">
+    <div class="ring">
+      <svg width="130" height="130" viewBox="0 0 130 130">
+        <circle cx="65" cy="65" r="52" fill="none" stroke="#eef2f7" stroke-width="13"/>
+        <circle cx="65" cy="65" r="52" fill="none" stroke="#dc2626" stroke-width="13"
+          stroke-linecap="round" stroke-dasharray="104.5 326.7"
+          transform="rotate(-90 65 65)"/>
+        <text x="65" y="60" text-anchor="middle" class="num" fill="#dc2626">32</text>
+        <text x="65" y="82" text-anchor="middle" font-size="12" fill="#64748b">من 100</text>
+      </svg>
+    </div>
+    <div class="score-meta">
+      <h2 style="margin-bottom:8px">التقييم العام</h2>
+      <span class="lbl" style="background:#dc2626">ضعيف — يحتاج عملاً عاجلاً</span>
+      <p style="color:var(--muted);margin:12px 0 0">
+        هذا التقييم يقيس جاهزية موقعك لتحويل الزائر إلى عميل فعلي،
+        مع تركيز خاص على الحجز والتواصل عبر واتساب.
+      </p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>تفصيل المحاور</h2>
+    <div class="dim"><div class="dim-head"><span>الحجز/التحويل</span><span class="dim-val" style="color:#dc2626">0/100</span></div><div class="bar"><i style="width:0%;background:#dc2626"></i></div></div><div class="dim"><div class="dim-head"><span>التواصل</span><span class="dim-val" style="color:#dc2626">0/100</span></div><div class="bar"><i style="width:0%;background:#dc2626"></i></div></div><div class="dim"><div class="dim-head"><span>توافق الجوال</span><span class="dim-val" style="color:#d97706">70/100</span></div><div class="bar"><i style="width:70%;background:#d97706"></i></div></div><div class="dim"><div class="dim-head"><span>الأمان (HTTPS)</span><span class="dim-val" style="color:#16a34a">100/100</span></div><div class="bar"><i style="width:100%;background:#16a34a"></i></div></div><div class="dim"><div class="dim-head"><span>تهيئة محركات البحث (SEO)</span><span class="dim-val" style="color:#dc2626">38/100</span></div><div class="bar"><i style="width:38%;background:#dc2626"></i></div></div><div class="dim"><div class="dim-head"><span>المحتوى</span><span class="dim-val" style="color:#dc2626">0/100</span></div><div class="bar"><i style="width:0%;background:#dc2626"></i></div></div><div class="dim"><div class="dim-head"><span>الحداثة والوزن</span><span class="dim-val" style="color:#16a34a">100/100</span></div><div class="bar"><i style="width:100%;background:#16a34a"></i></div></div>
+  </div>
+
+  <div class="card">
+    <h2>أبرز نقاط القوة</h2>
+    <ul class="good"><li>الاتصال آمن ومشفّر (HTTPS).</li><li>الصفحة خفيفة وسريعة التحميل نسبياً.</li></ul>
+  </div>
+
+  <div class="card">
+    <h2>مشاكل تستحق المعالجة</h2>
+    <ul class="bad"><li>لا توجد دعوة واضحة للحجز أو الطلب — الزائر لا يعرف الخطوة التالية، وهذا يُهدر معظم الزيارات.</li><li>لا يوجد نموذج حجز/تواصل مباشر داخل الموقع، فالعميل مضطر للبحث عن طريقة للتواصل.</li><li>لا يوجد زر واتساب — وهو أسرع قناة تحويل للعملاء محلياً.</li><li>يصعب الوصول لرقم الهاتف أو موقع المنشأة على الخريطة بسهولة.</li><li>لا يوجد وصف ميتا (meta description) — جوجل يعرض نصاً عشوائياً بدلاً منه.</li></ul>
+  </div>
+
+  <div class="card">
+    <h2>خطة تطوير على ٣ مراحل</h2>
+    <div class="phase"><div class="phase-top"><h4>المرحلة الأولى — الأساسات</h4><span class="when">أسبوع 1</span></div><ul><li>ضبط عنوان ووصف الصفحة ووسوم المشاركة للظهور في البحث.</li></ul></div><div class="phase"><div class="phase-top"><h4>المرحلة الثانية — التحويل</h4><span class="when">أسبوع 2</span></div><ul><li>إضافة زر واتساب عائم ورقم اتصال مباشر.</li><li>إضافة دعوة واضحة للحجز/الطلب في أعلى الصفحة.</li><li>صفحة خدمات وأسعار وساعات عمل واضحة.</li></ul></div><div class="phase"><div class="phase-top"><h4>المرحلة الثالثة — الأتمتة والنمو</h4><span class="when">مستمر</span></div><ul><li>ربط نظام حجز/مواعيد ذاتي يعمل ٢٤ ساعة بلا تدخّل.</li><li>مساعد واتساب آلي للرد على الاستفسارات وتأكيد الحجوزات.</li><li>متابعة الأداء وتحسين معدّل التحويل شهرياً.</li></ul></div>
+  </div>
+
+  <div class="card">
+    <h2>كيف نساعدك؟ خدمتان جاهزتان</h2>
+    <div class="offers">
+      <div class="offer">
+        <span class="pill">الخدمة الأولى</span>
+        <h3>تطوير / بناء الموقع</h3>
+        <p>موقع سريع، متوافق مع الجوال، مهيّأ لمحركات البحث، ومصمّم
+           لتحويل الزائر إلى عميل — يعالج كل المشاكل أعلاه.</p>
+      </div>
+      <div class="offer">
+        <span class="pill">الخدمة الثانية</span>
+        <h3>نظام حجز + مساعد واتساب</h3>
+        <p>حجز مواعيد ذاتي يعمل ٢٤ ساعة، ومساعد واتساب آلي يردّ على
+           العملاء ويؤكّد الحجوزات تلقائياً.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="cta">
+    <a class="btn" href="https://wa.me/966501234567?text=%D8%A7%D9%84%D8%B3%D9%84%D8%A7%D9%85%20%D8%B9%D9%84%D9%8A%D9%83%D9%85%D8%8C%20%D8%B4%D8%A7%D9%87%D8%AF%D8%AA%20%D8%AA%D9%82%D8%B1%D9%8A%D8%B1%20%D9%85%D9%88%D9%82%D8%B9%20%C2%AB%D9%85%D8%B7%D8%B9%D9%85%20%D8%A7%D9%84%D8%B0%D9%88%D9%82%20%D8%A7%D9%84%D8%B1%D9%81%D9%8A%D8%B9%C2%BB%20%D9%85%D9%86%20%D9%88%D8%A7%D8%AC%D9%87%D8%A9%20%28%D8%A7%D9%84%D8%AF%D8%B1%D8%AC%D8%A9%2032/100%29%20%D9%88%D8%A3%D8%B1%D8%BA%D8%A8%20%D8%A8%D8%AA%D8%B7%D9%88%D9%8A%D8%B1%D9%87%20%D9%88%D8%A5%D8%B6%D8%A7%D9%81%D8%A9%20%D8%A7%D9%84%D8%AD%D8%AC%D8%B2%20%D8%B9%D8%A8%D8%B1%20%D9%88%D8%A7%D8%AA%D8%B3%D8%A7%D8%A8." target="_blank" rel="noopener">
+      احجز استشارتك المجانية عبر واتساب
+    </a>
+  </div>
+
+  <div class="foot">
+    أُنشئ هذا التقرير بواسطة واجهة · 2026-06-27 09:03
+  </div>
+
+</div>
+</body>
+</html>

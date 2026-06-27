@@ -47,6 +47,14 @@ from flask import (
 # إعادة استخدام أدوات الهاتف والتحميل من محرّك العملاء
 from leads import normalize_phone, whatsappable, load_records
 
+# وحدات منصّة النمو (بُنيت متوازية): CRM، تدقيق المواقع، التسعير، التقارير، جسر whats_bot
+from crm import (ensure_prospects_table, upsert_prospect, mark_sent,
+                 set_status as crm_set_status, list_prospects, stats_by_status, STATUSES)
+from audit import audit_site, render_report
+from pricing import suggest_plan
+from reports import compute_stats, render_dashboard
+from whatsbot_bridge import handoff_prospect
+
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -246,6 +254,7 @@ def init_db() -> None:
     conn = get_db()
     conn.executescript(SCHEMA)
     _migrate(conn)
+    ensure_prospects_table(conn)   # جدول CRM (العملاء المحتملون/المتابعة)
     conn.commit()
     conn.close()
 
@@ -841,6 +850,149 @@ def owner_import():
 
 
 # --------------------------------------------------------------------------- #
+# CRM (المتابعة) + تدقيق المواقع + التقارير + جسر whats_bot                    #
+# --------------------------------------------------------------------------- #
+def _get_prospect(conn, pid):
+    return conn.execute("SELECT * FROM prospects WHERE id=?", (pid,)).fetchone()
+
+
+def _feat_id(url):
+    m = re.search(r"0x[0-9a-fA-F]+:0x[0-9a-fA-F]+", url or "")
+    return m.group(0) if m else ""
+
+
+@app.route("/owner/crm")
+def owner_crm():
+    if not is_owner():
+        return redirect(url_for("owner_dash"))
+    conn = get_db()
+    try:
+        prospects = list_prospects(conn)
+        stats = stats_by_status(conn)
+    finally:
+        conn.close()
+    return render_template_string(CRM_HTML, prospects=prospects, stats=stats, statuses=STATUSES)
+
+
+@app.route("/api/owner/prospects/import", methods=["POST"])
+def owner_prospects_import():
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "ارفع ملف JSON من السحب"}), 400
+    try:
+        data = json.loads(f.read().decode("utf-8"))
+    except Exception:
+        return jsonify({"error": "ملف JSON غير صالح"}), 400
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return jsonify({"error": "صيغة غير متوقعة"}), 400
+    conn = get_db()
+    try:
+        before = conn.execute("SELECT COUNT(*) AS c FROM prospects").fetchone()["c"]
+        processed = 0
+        for r in data:
+            if not isinstance(r, dict) or not r.get("name"):
+                continue
+            intl = normalize_phone(r.get("phone"), "966")
+            wa = intl if (intl and whatsappable(intl, r.get("phone"), "966")) else ""
+            with _book_lock:
+                upsert_prospect(conn, {
+                    "feature_id": _feat_id(r.get("place_url", "")),
+                    "name": r.get("name", ""), "phone": r.get("phone", ""),
+                    "whatsapp": wa, "category": r.get("category", ""),
+                    "website": r.get("website", ""), "source": "خرائط Google",
+                })
+            processed += 1
+        conn.commit()
+        after = conn.execute("SELECT COUNT(*) AS c FROM prospects").fetchone()["c"]
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "added": after - before, "updated": processed - (after - before)})
+
+
+@app.route("/api/owner/prospect/<int:pid>/status", methods=["POST"])
+def owner_prospect_status(pid):
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    conn = get_db()
+    try:
+        ok = crm_set_status(conn, pid, f.get("status", ""), f.get("notes"))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": ok}) if ok else (jsonify({"error": "حالة غير صالحة أو منشأة غير موجودة"}), 400)
+
+
+@app.route("/api/owner/prospect/<int:pid>/sent", methods=["POST"])
+def owner_prospect_sent(pid):
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    conn = get_db()
+    try:
+        rec = mark_sent(conn, pid, f.get("message", "أُرسلت رسالة"), f.get("report_url"))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": bool(rec)})
+
+
+@app.route("/owner/prospect/<int:pid>/audit")
+def owner_prospect_audit(pid):
+    if not is_owner():
+        return redirect(url_for("owner_dash"))
+    conn = get_db()
+    try:
+        p = _get_prospect(conn, pid)
+        if not p:
+            abort(404)
+        business = {"name": p["name"], "phone": p["phone"], "website": p["website"]}
+        site = (p["website"] or "").strip()
+        if not site:
+            return Response(
+                "<div dir='rtl' style='font-family:Tahoma;padding:40px;text-align:center'>"
+                "هذه المنشأة <b>بلا موقع</b> — اعرض خدمة بناء موقع + حجز عبر واتساب 💬</div>",
+                mimetype="text/html")
+        au = audit_site(site)
+        conn.execute("UPDATE prospects SET audit_score=?, updated_at=? WHERE id=?",
+                     (au.get("score"), datetime.now().isoformat(timespec="seconds"), pid))
+        conn.commit()
+    finally:
+        conn.close()
+    return Response(render_report(business, au), mimetype="text/html")
+
+
+@app.route("/owner/reports")
+def owner_reports():
+    if not is_owner():
+        return redirect(url_for("owner_dash"))
+    conn = get_db()
+    try:
+        prospects = list_prospects(conn)
+    finally:
+        conn.close()
+    return Response(render_dashboard(compute_stats(prospects)), mimetype="text/html")
+
+
+@app.route("/api/owner/prospect/<int:pid>/handoff", methods=["POST"])
+def owner_prospect_handoff(pid):
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    conn = get_db()
+    try:
+        p = _get_prospect(conn, pid)
+    finally:
+        conn.close()
+    if not p:
+        return jsonify({"error": "غير موجود"}), 404
+    return jsonify(handoff_prospect({"name": p["name"], "phone": p["phone"], "category": p["category"]}))
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
 def import_records(records, country: str = "966") -> list[dict]:
@@ -1150,7 +1302,12 @@ OWNER_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UT
 input,select{padding:6px 8px;font-size:13px}
 </style></head><body><div class="wrap">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <h1>👑 لوحة المالك</h1><a class="btn" style="background:#eef1f4;color:#3b4a5a" href="/owner/logout">خروج</a></div>
+  <h1>👑 لوحة المالك</h1>
+  <div style="display:flex;gap:8px">
+    <a class="btn p" href="/owner/crm">📇 المتابعة (CRM)</a>
+    <a class="btn" style="background:#e7f7f0;color:#0c6b60" href="/owner/reports">📊 التقارير</a>
+    <a class="btn" style="background:#eef1f4;color:#3b4a5a" href="/owner/logout">خروج</a>
+  </div></div>
 <div class="kpis">
   <div class="kpi"><b>{{ clients }}</b>العملاء</div>
   <div class="kpi g"><b>{{ active }}</b>اشتراك نشط</div>
@@ -1215,6 +1372,82 @@ async function doImport(){
     }
     el.innerHTML=html;
   }catch(e){el.textContent='تعذّر الاتصال بالخادم';}
+}
+</script></body></html>"""
+
+
+CRM_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>المتابعة — CRM</title>
+<style>""" + _BASE_CSS + """
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:16px}
+.kpi{background:#fff;border:1px solid #e3e8ee;border-radius:14px;padding:14px;text-align:center}
+.kpi b{display:block;font-size:24px;color:#128C7E}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202124;color:#fff;padding:10px 18px;border-radius:10px;display:none}
+select,input{padding:6px 8px;font-size:13px}
+.sc{display:inline-block;min-width:34px;text-align:center;padding:3px 8px;border-radius:20px;font-weight:700;color:#fff}
+.sc.lo{background:#ea4335}.sc.mid{background:#fbbc04;color:#202124}.sc.hi{background:#34a853}.sc.na{background:#9aa0a6}
+.act a,.act button{font-size:12px;padding:5px 9px;border-radius:7px;border:0;cursor:pointer;text-decoration:none;margin-inline-start:3px}
+.act .au{background:#e7f7f0;color:#0c6b60}.act .wa{background:#25d366;color:#fff}.act .hb{background:#eef1f4;color:#3b4a5a}
+</style></head><body><div class="wrap">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+  <h1>📇 المتابعة (CRM)</h1>
+  <div style="display:flex;gap:8px"><a class="btn" style="background:#e7f7f0;color:#0c6b60" href="/owner/reports">📊 التقارير</a>
+  <a class="btn" style="background:#eef1f4;color:#3b4a5a" href="/owner">← اللوحة</a></div></div>
+
+<div class="kpis">
+  <div class="kpi"><b>{{ stats.values()|sum }}</b>الإجمالي</div>
+  <div class="kpi"><b>{{ stats.get('أُرسل',0) }}</b>أُرسل لهم</div>
+  <div class="kpi"><b>{{ stats.get('ردّ',0) }}</b>ردّوا</div>
+  <div class="kpi"><b>{{ stats.get('مهتم',0) }}</b>مهتمّون</div>
+  <div class="kpi"><b>{{ stats.get('عميل',0) }}</b>عملاء</div>
+</div>
+
+<div class="card"><h2>📥 استيراد عملاء محتملين</h2>
+  <p class="muted" style="font-size:13px">ارفع ملف JSON من السحب — يُحفظون للمتابعة (بلا تكرار).</p>
+  <input type="file" id="impf" accept=".json"><button class="btn p" onclick="doImport()">استيراد</button>
+  <span id="impr" class="muted"></span>
+</div>
+
+<div class="card"><h2>العملاء ({{ prospects|length }})</h2>
+<table><thead><tr><th>المنشأة</th><th>الفئة</th><th>الموقع</th><th>درجة الموقع</th><th>الحالة</th><th>آخر تواصل</th><th>إجراءات</th></tr></thead><tbody>
+{% for p in prospects %}
+<tr>
+  <td><strong>{{ p['name'] }}</strong></td>
+  <td class="muted">{{ p['category'] }}</td>
+  <td>{% if p['website'] %}<a href="{{ p['website'] }}" target="_blank">موقع</a>{% else %}<span style="color:#ea4335">بلا موقع</span>{% endif %}</td>
+  <td>{% set s=p['audit_score'] %}
+    {% if s is none %}<span class="sc na">—</span>
+    {% elif s>=70 %}<span class="sc hi">{{ s }}</span>
+    {% elif s>=40 %}<span class="sc mid">{{ s }}</span>
+    {% else %}<span class="sc lo">{{ s }}</span>{% endif %}</td>
+  <td><select id="st{{ p['id'] }}" data-id="{{ p['id'] }}" onchange="onStatus(this)">
+    {% for st in statuses %}<option value="{{ st }}" {{ 'selected' if p['status']==st else '' }}>{{ st }}</option>{% endfor %}
+  </select></td>
+  <td class="muted" style="font-size:12px">{{ (p['last_contacted_at'] or '—')[:16] }}</td>
+  <td class="act">
+    <a class="au" href="/owner/prospect/{{ p['id'] }}/audit" target="_blank">🔍 تدقيق</a>
+    {% if p['whatsapp'] %}<a class="wa" href="https://wa.me/{{ p['whatsapp'] }}" target="_blank">واتساب</a>{% endif %}
+    <button class="hb" onclick="handoff({{ p['id'] }})">whats_bot</button>
+  </td>
+</tr>
+{% else %}<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">لا يوجد عملاء بعد. استورد ملف السحب بالأعلى.</td></tr>{% endfor %}
+</tbody></table></div></div>
+<div class="toast" id="toast"></div>
+<script>
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',1500);}
+function setStatus(id,status,notes){
+  fetch('/api/owner/prospect/'+id+'/status',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({status:status,notes:notes})}).then(r=>r.json()).then(d=>toast(d.ok?'حُفظ ✓':('خطأ: '+(d.error||''))));
+}
+function onStatus(sel){setStatus(sel.dataset.id,sel.value,null);}
+function handoff(id){fetch('/api/owner/prospect/'+id+'/handoff',{method:'POST'}).then(r=>r.json()).then(d=>toast(d.note||d.action||'تم التسليم'));}
+async function doImport(){
+  const f=document.getElementById('impf').files[0]; if(!f){alert('اختر ملف JSON');return;}
+  const fd=new FormData(); fd.append('file',f);
+  document.getElementById('impr').textContent='جارٍ…';
+  const r=await fetch('/api/owner/prospects/import',{method:'POST',body:fd}); const d=await r.json();
+  document.getElementById('impr').textContent = r.ok ? ('أُضيف '+d.added+' — يُحدّث…') : ('خطأ: '+(d.error||''));
+  if(r.ok) setTimeout(()=>location.reload(),900);
 }
 </script></body></html>"""
 

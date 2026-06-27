@@ -41,6 +41,15 @@ logging.basicConfig(
 logger = logging.getLogger("gmaps_web")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+app.config["TEMPLATES_AUTO_RELOAD"] = True  # تحديثات الواجهة تظهر دون إعادة تشغيل
+
+
+@app.after_request
+def _no_cache_html(resp):
+    # امنع تخزين صفحة الواجهة في المتصفح حتى تظهر التحديثات فوراً بعد إعادة التشغيل
+    if resp.mimetype == "text/html":
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    return resp
 
 # مخزن المهام في الذاكرة (يكفي للاستخدام المحلي)
 from collections import OrderedDict
@@ -220,12 +229,35 @@ def api_status(job_id: str):
 # --------------------------------------------------------------------------- #
 # حفظ النتائج مباشرةً في القاعدة السحابية (نظام الحجز) — وسيط لتفادي CORS       #
 # --------------------------------------------------------------------------- #
+CLOUD_CFG_PATH = Path("booking_data") / "cloud.json"
+
+
+def _cloud_cfg() -> dict:
+    """إعداد السحابة المحفوظ محلياً (ملف محميّ، مستثنى من Git)."""
+    try:
+        return json.loads(CLOUD_CFG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@app.route("/api/cloud_config")
+def cloud_config():
+    """يُعيد الرابط المحفوظ + هل المفتاح مضبوط (دون كشف المفتاح) لملء الواجهة تلقائياً."""
+    cfg = _cloud_cfg()
+    url = (cfg.get("url") or os.environ.get("BOOKING_CLOUD_URL") or "").strip()
+    key = (cfg.get("key") or os.environ.get("BOOKING_OWNER_PASSWORD") or "").strip()
+    return jsonify({"cloud_url": url, "has_key": bool(key)})
+
+
 @app.route("/api/save_to_cloud", methods=["POST"])
 def save_to_cloud():
     body = request.get_json(force=True, silent=True) or {}
     results = body.get("results") or []
-    cloud = (body.get("cloud_url") or os.environ.get("BOOKING_CLOUD_URL") or "").strip().rstrip("/")
-    key = (body.get("owner_key") or os.environ.get("BOOKING_OWNER_PASSWORD") or "").strip()
+    cfg = _cloud_cfg()
+    cloud = (body.get("cloud_url") or os.environ.get("BOOKING_CLOUD_URL")
+             or cfg.get("url") or "").strip().rstrip("/")
+    key = (body.get("owner_key") or os.environ.get("BOOKING_OWNER_PASSWORD")
+           or cfg.get("key") or "").strip()
     if not cloud:
         return jsonify({"error": "حدّد رابط النظام السحابي"}), 400
     if not key:
@@ -240,7 +272,9 @@ def save_to_cloud():
     )
     try:
         with urllib.request.urlopen(req, timeout=90) as r:
-            return jsonify(json.loads(r.read().decode("utf-8")))
+            out = json.loads(r.read().decode("utf-8"))
+        out["cloud_url"] = cloud  # ليفتح المتصفحُ الموقعَ بعد الحفظ
+        return jsonify(out)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:200]
         msg = "كلمة مرور المالك غير صحيحة" if e.code == 403 else f"رفضت السحابة ({e.code}): {detail}"
@@ -253,8 +287,12 @@ def save_to_cloud():
 # الركض                                                                        #
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
+    import webbrowser
+    url = "http://localhost:5000"
     print("=" * 55)
     print(" أداة سحب Google Maps — واجهة الويب")
-    print(" افتح المتصفح على: http://localhost:5000")
+    print(" افتح المتصفح على:", url)
     print("=" * 55)
+    # افتح المتصفح تلقائياً بعد لحظة (حتى يكون الخادم جاهزاً)
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     app.run(host="127.0.0.1", port=5000, debug=False)

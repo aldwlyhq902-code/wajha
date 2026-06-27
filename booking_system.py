@@ -1774,6 +1774,52 @@ def owner_webhook_debug():
     return jsonify({"count": len(out), "log": out})
 
 
+@app.route("/api/owner/reset", methods=["POST"])
+def owner_reset():
+    """تصفير بيانات (نهائيّ). مالك أو X-Owner-Key + تأكيد صريح confirm='DELETE'.
+
+    scope: 'all' (كل شيء: prospects+businesses+bookings+webhook_log)،
+           'prospects' (الاستهداف/المتابعة فقط)، 'test' («اختبار واجهة» فقط).
+    """
+    if not (is_owner() or _verify_owner_pw((request.headers.get("X-Owner-Key") or "").strip())):
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    scope = (f.get("scope") or "").lower()
+    if f.get("confirm") != "DELETE":
+        return jsonify({"error": "تأكيد مفقود — أرسل confirm='DELETE'"}), 400
+    if scope not in ("all", "prospects", "test"):
+        return jsonify({"error": "نطاق غير صالح"}), 400
+    conn = get_db()
+    deleted = {}
+
+    def _cnt(t):
+        try:
+            return conn.execute(f"SELECT COUNT(*) AS c FROM {t}").fetchone()["c"] or 0
+        except Exception:
+            return 0
+
+    try:
+        with _book_lock:
+            if scope == "test":
+                before = _cnt("prospects")
+                conn.execute("DELETE FROM prospects WHERE name=?", ("اختبار واجهة",))
+                deleted["prospects"] = before - _cnt("prospects")
+            elif scope == "prospects":
+                deleted["prospects"] = _cnt("prospects")
+                conn.execute("DELETE FROM prospects")
+            else:  # all
+                for t in ("bookings", "prospects", "businesses", "webhook_log"):
+                    deleted[t] = _cnt(t)
+                    try:
+                        conn.execute(f"DELETE FROM {t}")
+                    except Exception:
+                        pass
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "scope": scope, "deleted": deleted})
+
+
 @app.route("/api/owner/prospects")
 def api_owner_prospects():
     """قائمة العملاء JSON (لجلسة المالك أو لأداة المتابعة عبر X-Owner-Key)."""

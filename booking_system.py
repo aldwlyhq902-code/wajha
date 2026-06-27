@@ -41,7 +41,7 @@ from datetime import datetime, date as date_cls, timedelta
 from email.mime.text import MIMEText
 from html import escape as html_escape
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from flask import (
     Flask, request, session, redirect, url_for,
@@ -82,6 +82,8 @@ DATA_DIR = Path(os.environ.get("BOOKING_DATA_DIR", "booking_data"))
 DB_PATH = DATA_DIR / "booking.db"
 SECRET_PATH = DATA_DIR / ".secret"
 MAX_AHEAD_DAYS = 60
+# رقم واتساب المبيعات (للتواصل من صفحة التدقيق المجانيّ) — قابل للضبط بالبيئة
+SALES_WHATSAPP = os.environ.get("SALES_WHATSAPP", "966500465008").strip()
 
 TYPE_LABELS = {
     "table":       {"title": "احجز طاولة", "count_on": True,  "count_label": "عدد الأشخاص", "service_on": False, "service_label": ""},
@@ -1357,6 +1359,127 @@ def track_click():
     if not valid:
         return redirect("/")
     return redirect(url, code=302)
+
+
+# --------------------------------------------------------------------------- #
+# قمع الجذب (Inbound opt-in): صفحة تدقيق مجانيّ تلتقط العميل بموافقته             #
+# --------------------------------------------------------------------------- #
+AUDIT_LANDING_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>تدقيق موقعك المجانيّ — واجهة</title>
+<meta name="description" content="افحص جاهزية موقعك لتحويل الزوّار إلى عملاء خلال ثوانٍ — تقرير فوريّ مجانيّ.">
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:"Segoe UI",Tahoma,"Cairo",sans-serif}
+body{background:linear-gradient(160deg,#0d6e63,#128C7E);color:#0f172a;min-height:100vh;line-height:1.7}
+.wrap{max-width:560px;margin:0 auto;padding:32px 18px}
+.hero{text-align:center;color:#fff;margin-bottom:22px}
+.hero .b{display:inline-block;background:#ffffff22;padding:5px 14px;border-radius:20px;font-size:13px;font-weight:700;margin-bottom:12px}
+.hero h1{font-size:30px;font-weight:850;line-height:1.25}
+.hero p{opacity:.95;margin-top:10px;font-size:16px}
+.card{background:#fff;border-radius:18px;padding:24px;box-shadow:0 20px 50px rgba(0,0,0,.22)}
+label{display:block;font-size:14px;font-weight:700;color:#334155;margin:12px 0 5px}
+input{width:100%;padding:13px;border:1.5px solid #d4dbe2;border-radius:11px;font-size:15px;font-family:inherit}
+input:focus{outline:0;border-color:#128C7E;box-shadow:0 0 0 3px rgba(18,140,126,.15)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.consent{display:flex;gap:9px;align-items:flex-start;margin-top:14px;font-size:13px;color:#475569}
+.consent input{width:auto;margin-top:3px}
+.btn{width:100%;margin-top:16px;background:#25D366;color:#053d2b;border:0;border-radius:13px;
+  padding:15px;font-size:17px;font-weight:850;cursor:pointer;font-family:inherit}
+.btn:hover{filter:brightness(1.05)}.btn:disabled{opacity:.6;cursor:wait}
+.err{color:#dc2626;font-size:13px;margin-top:8px;min-height:16px}
+.feat{display:flex;justify-content:center;gap:18px;flex-wrap:wrap;margin-top:16px;color:#fff;font-size:13px;opacity:.92}
+.note{text-align:center;color:#fff;opacity:.8;font-size:12px;margin-top:14px}
+</style></head><body><div class="wrap">
+<div class="hero">
+  <div class="b">واجهة · تدقيق رقميّ مجانيّ</div>
+  <h1>هل موقعك يحوّل الزوّار إلى عملاء؟</h1>
+  <p>أدخل رابط موقعك واحصل على <b>تقرير فوريّ</b> يقيس الحجز والتواصل والظهور في البحث وتوافق الجوال.</p>
+</div>
+<div class="card">
+  <form id="f" method="post" action="/audit">
+    <label>رابط موقعك *</label>
+    <input name="website" id="website" placeholder="example.com" inputmode="url" required>
+    <div class="row">
+      <div><label>اسم المنشأة</label><input name="name" placeholder="عيادتك / صالونك"></div>
+      <div><label>الجوال (واتساب)</label><input name="phone" inputmode="tel" placeholder="05xxxxxxxx"></div>
+    </div>
+    <label>البريد (اختياري)</label>
+    <input name="email" inputmode="email" placeholder="you@example.com">
+    <label class="consent"><input type="checkbox" name="consent" id="consent" value="1">
+      أوافق على تواصل فريق «واجهة» معي بخصوص تطوير موقعي وخدمات الحجز عبر واتساب.</label>
+    <button class="btn" id="go" type="submit">⚡ افحص موقعي الآن مجانًا</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+<div class="feat"><span>✅ نتيجة خلال ثوانٍ</span><span>🔒 بلا التزام</span><span>📊 تقرير احترافيّ</span></div>
+<div class="note">يُحفظ رقمك فقط عند موافقتك، ويمكنك طلب التوقّف في أي وقت.</div>
+<script>
+document.getElementById('f').addEventListener('submit',function(e){
+  var w=document.getElementById('website').value.trim();
+  if(!w){e.preventDefault();document.getElementById('err').textContent='أدخل رابط موقعك';return;}
+  var g=document.getElementById('go');g.disabled=true;g.textContent='جارٍ فحص موقعك…';
+});
+</script>
+</div></body></html>"""
+
+
+@app.route("/audit", methods=["GET"])
+def audit_landing():
+    """صفحة تدقيق مجانيّ عامّة (قمع جذب inbound)."""
+    return render_template_string(AUDIT_LANDING_HTML)
+
+
+@app.route("/audit", methods=["POST"])
+def audit_run():
+    """يدقّق الموقع المُدخَل، يعرض التقرير، ويلتقط العميل عند موافقته الصريحة (opt-in)."""
+    # حدّ أشدّ لهذا المسار العام المكلِّف (جلب شبكيّ) — فوق الحدّ العامّ
+    if _rate_limited("audit:" + _client_ip(), limit=12, window=60.0):
+        return Response("طلبات كثيرة، حاول بعد دقيقة.", status=429, mimetype="text/plain")
+    website = (request.form.get("website") or "").strip()
+    name = (request.form.get("name") or "").strip()[:80]
+    phone = (request.form.get("phone") or "").strip()[:30]
+    email = (request.form.get("email") or "").strip()[:120]
+    consent = request.form.get("consent") in ("1", "on", "true", "yes")
+    if not website:
+        return redirect(url_for("audit_landing"))
+
+    au = audit_site(website)   # محميّ ضدّ SSRF داخل audit._fetch
+
+    # التقاط العميل فقط عند موافقة صريحة + وسيلة تواصل (امتثال PDPL: opt-in)
+    captured = False
+    if consent and (phone or email):
+        intl = normalize_phone(phone, "966") if phone else None
+        wa = intl if (intl and whatsappable(intl, phone, "966")) else ""
+        now = datetime.now().isoformat(timespec="seconds")
+        conn = get_db()
+        try:
+            with _book_lock:
+                p = upsert_prospect(conn, {
+                    "name": name or (urlparse(au.get("url", website)).hostname or "زائر"),
+                    "phone": phone, "whatsapp": wa, "email": email,
+                    "website": au.get("url", website), "category": "",
+                    "source": "تدقيق ذاتي (جذب)", "opt_in": 1, "consent_at": now,
+                })
+                save_audit(conn, p["id"], au)
+                conn.commit()
+            captured = True
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    # CTA يتواصل مع فريق المبيعات (لا مع العميل نفسه)
+    score = int(au.get("score") or 0)
+    wa_msg = (f"السلام عليكم، فحصتُ موقعي ({website}) عبر «واجهة» والنتيجة {score}/100، "
+              f"وأرغب بتطويره وإضافة الحجز عبر واتساب.")
+    cta = f"https://wa.me/{SALES_WHATSAPP}?text={quote(wa_msg)}"
+    business = {"name": name or "موقعك", "website": au.get("url", website)}
+    html = render_report(business, au, cta_url=cta)
+    if captured:
+        banner = ("<div style='background:#e6f4ea;color:#137333;text-align:center;"
+                  "padding:10px;font-family:Tahoma'>✅ تم استلام طلبك — سيتواصل معك فريق «واجهة» قريبًا.</div>")
+        html = html.replace("<body>", "<body>" + banner, 1)
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/api/owner/campaign/send", methods=["POST"])

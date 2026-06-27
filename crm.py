@@ -69,7 +69,7 @@ _PROSPECT_FIELDS = (
     "feature_id", "name", "phone", "whatsapp", "email", "category", "city", "source",
     "website", "audit_score", "audit_issues", "audit_strengths", "status",
     "last_message", "report_url", "notes", "last_contacted_at",
-    "is_target", "target_rank", "channel",
+    "is_target", "target_rank", "channel", "opt_in", "consent_at",
 )
 
 # أعمدة إضافية تُدار عبر دوال مخصّصة (تتبّع/تدقيق/استهداف) — تُضاف بالترحيل إن غابت.
@@ -82,6 +82,8 @@ _EXTRA_COLUMNS = {
     "is_target": "INTEGER DEFAULT 0",
     "target_rank": "INTEGER",
     "channel": "TEXT",
+    "opt_in": "INTEGER DEFAULT 0",
+    "consent_at": "TEXT",
     "opens": "INTEGER DEFAULT 0",
     "last_open_at": "TEXT",
     "clicks": "INTEGER DEFAULT 0",
@@ -140,6 +142,8 @@ def ensure_prospects_table(conn) -> None:
         " is_target INTEGER DEFAULT 0,"
         " target_rank INTEGER,"
         " channel TEXT,"
+        " opt_in INTEGER DEFAULT 0,"
+        " consent_at TEXT,"
         " opens INTEGER DEFAULT 0,"
         " last_open_at TEXT,"
         " clicks INTEGER DEFAULT 0,"

@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict
 from datetime import datetime
@@ -212,6 +215,38 @@ def api_status(job_id: str):
         "results": job["results"] if job["status"] == "done" else [],
         "count": len(job["results"]),
     })
+
+
+# --------------------------------------------------------------------------- #
+# حفظ النتائج مباشرةً في القاعدة السحابية (نظام الحجز) — وسيط لتفادي CORS       #
+# --------------------------------------------------------------------------- #
+@app.route("/api/save_to_cloud", methods=["POST"])
+def save_to_cloud():
+    body = request.get_json(force=True, silent=True) or {}
+    results = body.get("results") or []
+    cloud = (body.get("cloud_url") or os.environ.get("BOOKING_CLOUD_URL") or "").strip().rstrip("/")
+    key = (body.get("owner_key") or os.environ.get("BOOKING_OWNER_PASSWORD") or "").strip()
+    if not cloud:
+        return jsonify({"error": "حدّد رابط النظام السحابي"}), 400
+    if not key:
+        return jsonify({"error": "حدّد كلمة مرور المالك"}), 400
+    if not results:
+        return jsonify({"error": "لا توجد نتائج للحفظ"}), 400
+    req = urllib.request.Request(
+        cloud + "/api/owner/import",
+        data=json.dumps(results, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Owner-Key": key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            return jsonify(json.loads(r.read().decode("utf-8")))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        msg = "كلمة مرور المالك غير صحيحة" if e.code == 403 else f"رفضت السحابة ({e.code}): {detail}"
+        return jsonify({"error": msg}), 502
+    except Exception as e:
+        return jsonify({"error": f"تعذّر الاتصال بالسحابة: {e}"}), 502
 
 
 # --------------------------------------------------------------------------- #

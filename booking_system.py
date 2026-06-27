@@ -811,15 +811,21 @@ def owner_update_sub(bid):
 
 @app.route("/api/owner/import", methods=["POST"])
 def owner_import():
-    if not is_owner():
+    # مصادقة: جلسة المالك (من اللوحة) أو مفتاح في الترويسة (للحفظ البرمجي من أداة السحب)
+    key = request.headers.get("X-Owner-Key", "")
+    if not (is_owner() or (key and _verify_owner_pw(key))):
         return jsonify({"error": "غير مصرّح"}), 403
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "ارفع ملف JSON الناتج من السحب (output/*.json)"}), 400
-    try:
-        data = json.loads(f.read().decode("utf-8"))
-    except Exception:
-        return jsonify({"error": "ملف JSON غير صالح"}), 400
+    # المصدر: جسم JSON مباشر (برمجي) أو ملف مرفوع (من اللوحة)
+    if request.is_json:
+        data = request.get_json(silent=True)
+    else:
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"error": "ارفع ملف JSON أو أرسل جسم JSON"}), 400
+        try:
+            data = json.loads(f.read().decode("utf-8"))
+        except Exception:
+            return jsonify({"error": "ملف JSON غير صالح"}), 400
     if isinstance(data, dict):
         data = [data]
     if not isinstance(data, list):

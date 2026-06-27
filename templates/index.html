@@ -84,6 +84,16 @@
           <label><input type="checkbox" id="headless" checked> متصفح مخفي</label>
         </div>
       </div>
+      <div class="grid-3" style="margin-top:12px">
+        <div class="field">
+          <label>رابط النظام السحابي (للحفظ في القاعدة)</label>
+          <input type="text" id="cloud-url" placeholder="https://booking-system-y5id.onrender.com">
+        </div>
+        <div class="field">
+          <label>كلمة مرور المالك</label>
+          <input type="password" id="owner-key" placeholder="••••••••">
+        </div>
+      </div>
     </details>
 
     <div class="actions">
@@ -107,6 +117,7 @@
     <div class="results-header">
       <h2>النتائج (<span id="result-count">0</span>)</h2>
       <div class="export-buttons">
+        <button class="btn primary" id="btn-cloud">💾 حفظ في القاعدة</button>
         <button class="btn ghost" id="btn-json">⬇ تصدير JSON</button>
         <button class="btn ghost" id="btn-csv">⬇ تصدير CSV</button>
         <button class="btn ghost" id="btn-clear">✕ مسح</button>
@@ -463,6 +474,53 @@ document.getElementById("btn-clear").addEventListener("click", () => {
   resetUI();
   document.getElementById("results-card").classList.add("hidden");
 });
+
+// ====================================================================
+// الحفظ المباشر في القاعدة السحابية
+// ====================================================================
+// استرجاع/حفظ إعدادات السحابة محلياً (لا تُكتب كلمة المرور كل مرة)
+(function initCloudCfg(){
+  const u = document.getElementById("cloud-url"), k = document.getElementById("owner-key");
+  u.value = localStorage.getItem("cloud_url") || "";
+  k.value = localStorage.getItem("owner_key") || "";
+  u.addEventListener("change", () => localStorage.setItem("cloud_url", u.value.trim()));
+  k.addEventListener("change", () => localStorage.setItem("owner_key", k.value.trim()));
+})();
+
+document.getElementById("btn-cloud").addEventListener("click", saveToCloud);
+
+async function saveToCloud() {
+  applyFilters();
+  if (FILTERED.length === 0) { alert("لا توجد بيانات للحفظ"); return; }
+  const cloud_url = document.getElementById("cloud-url").value.trim();
+  const owner_key = document.getElementById("owner-key").value.trim();
+  if (!cloud_url || !owner_key) {
+    alert("أدخل رابط النظام السحابي وكلمة مرور المالك في «خيارات متقدمة».");
+    return;
+  }
+  localStorage.setItem("cloud_url", cloud_url);
+  localStorage.setItem("owner_key", owner_key);
+  const btn = document.getElementById("btn-cloud");
+  const orig = btn.textContent; btn.disabled = true; btn.textContent = "جارٍ الحفظ...";
+  try {
+    const resp = await fetch("/api/save_to_cloud", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({results: FILTERED, cloud_url, owner_key}),
+    });
+    const d = await resp.json();
+    if (!resp.ok) { alert("تعذّر الحفظ: " + (d.error || "خطأ")); return; }
+    let msg = `✓ حُفظ في القاعدة: أُضيف ${d.added} • تخطّي ${d.skipped} (مكرّرة)`;
+    if (d.businesses && d.businesses.length) {
+      msg += "\n\nأرقام PIN (احفظها لتسليمها للمنشآت):\n" +
+        d.businesses.map(b => `• ${b.name} — PIN ${b.pin}`).join("\n");
+    }
+    alert(msg);
+  } catch (e) {
+    alert("فشل الاتصال بالخادم المحلي: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
 
 // أعد ضبط حالة الفرز والفلاتر حتى لا تتسرّب إلى بحث جديد
 function resetUI() {

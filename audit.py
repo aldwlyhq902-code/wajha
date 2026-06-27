@@ -20,13 +20,47 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import re
+import socket
 import ssl
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime
 from urllib.parse import quote, urlparse
+
+
+def _is_blocked_host(host: str) -> bool:
+    """يحجب المضيفات الخاصّة/الحلقيّة/link-local (حماية SSRF). يحجب أيضًا ما لا يُحلّ."""
+    host = (host or "").strip()
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return True
+    for info in infos:
+        ip = info[4][0]
+        try:
+            ipo = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            continue
+        if (ipo.is_private or ipo.is_loopback or ipo.is_link_local
+                or ipo.is_reserved or ipo.is_multicast or ipo.is_unspecified):
+            return True
+    return False
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """يمنع التحويل إلى مضيف خاص/داخليّ (SSRF عبر redirect)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            if _is_blocked_host(urlparse(newurl).hostname or ""):
+                return None
+        except Exception:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 # إعادة استخدام أدوات الهاتف من محرّك العملاء (متوافقة مع بقية النظام)
 try:
@@ -117,6 +151,11 @@ def _fetch(url: str, timeout: int = 15) -> tuple[bool, str, str, str]:
     if not url:
         return False, url, "", "رابط فارغ"
 
+    # حماية SSRF: ارفض المضيفات الداخليّة/الخاصّة قبل أي اتصال
+    host = urlparse(url).hostname or ""
+    if _is_blocked_host(host):
+        return False, url, "", "مضيف غير مسموح (خاص/داخليّ)"
+
     ctx = ssl.create_default_context()
     # نتساهل في التحقق من الشهادة حتى لا نفشل الجلب لأسباب شهادة فقط
     ctx.check_hostname = False
@@ -127,8 +166,9 @@ def _fetch(url: str, timeout: int = 15) -> tuple[bool, str, str, str]:
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "ar,en;q=0.8",
     })
+    opener = urllib.request.build_opener(_SafeRedirect(), urllib.request.HTTPSHandler(context=ctx))
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             final_url = resp.geturl() or url
             raw = resp.read(2_500_000)  # حد أقصى ~2.5MB
             charset = "utf-8"
@@ -515,8 +555,14 @@ def render_report(business: dict, audit: dict, brand: str = "واجهة",
             f'<ul>{items}</ul></div>'
         )
 
-    site_line = (f'<a href="{_e(site)}" target="_blank" rel="noopener">{_e(site)}</a>'
-                 if site else "—")
+    # رابط آمن فقط (http/https) لمنع مخطّط javascript:/data: في href
+    _safe_site = site if re.match(r"^https?://", site or "", re.I) else ""
+    if _safe_site:
+        site_line = f'<a href="{_e(_safe_site)}" target="_blank" rel="noopener nofollow">{_e(site)}</a>'
+    elif site:
+        site_line = _e(site)
+    else:
+        site_line = "—"
     gen_dt = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # نسبة محيط الدائرة لشريط الدرجة الدائري

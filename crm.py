@@ -40,6 +40,21 @@ for _stream in (sys.stdout, sys.stderr):
 # --------------------------------------------------------------------------- #
 STATUSES = ["جديد", "أُرسل", "ردّ", "مهتم", "عرض", "عميل", "مرفوض", "موقوف"]
 
+# كلمات طلب التوقّف (opt-out) — أي ردّ يحويها يُوقف التواصل فورًا (امتثال PDPL + حماية الرقم)
+STOP_WORDS = (
+    "إيقاف", "ايقاف", "أوقف", "اوقف", "توقف", "قف", "إلغاء", "الغاء", "ألغ", "الغ",
+    "لا ترسل", "لا تراسل", "لا تراسلني", "بدون رسائل", "ازالة", "إزالة", "احذف",
+    "stop", "unsubscribe", "remove", "cancel", "opt out", "optout",
+)
+
+
+def is_stop_message(text) -> bool:
+    """هل الرسالة طلب توقّف صريح؟ (مطابقة جزئية متسامحة)."""
+    if not text:
+        return False
+    t = str(text).strip().lower()
+    return any(w.lower() in t for w in STOP_WORDS)
+
 
 # --------------------------------------------------------------------------- #
 # أدوات داخلية                                                                 #
@@ -63,6 +78,7 @@ _EXTRA_COLUMNS = {
     "email": "TEXT",
     "audit_issues": "TEXT",
     "audit_strengths": "TEXT",
+    "audit_dims": "TEXT",
     "is_target": "INTEGER DEFAULT 0",
     "target_rank": "INTEGER",
     "channel": "TEXT",
@@ -115,6 +131,7 @@ def ensure_prospects_table(conn) -> None:
         " audit_score INTEGER,"
         " audit_issues TEXT,"
         " audit_strengths TEXT,"
+        " audit_dims TEXT,"
         " status TEXT DEFAULT 'جديد',"
         " last_message TEXT,"
         " report_url TEXT,"
@@ -212,10 +229,22 @@ def save_audit(conn, prospect_id, audit: dict) -> bool:
     strengths = audit.get("strengths") or []
     issues_text = " • ".join(str(x) for x in issues)[:2000] if issues else ""
     strengths_text = " • ".join(str(x) for x in strengths)[:2000] if strengths else ""
+    # نخزّن صورة كاملة للتدقيق (JSON) ليُعرض التقرير لاحقًا بلا أي جلب شبكيّ حيّ
+    import json as _json
+    snapshot = {
+        "url": audit.get("url", ""), "score": score, "dims": audit.get("dims", {}),
+        "issues": list(issues), "strengths": list(strengths),
+        "has_booking": audit.get("has_booking"), "has_whatsapp": audit.get("has_whatsapp"),
+        "https": audit.get("https"), "mobile": audit.get("mobile"),
+    }
+    try:
+        dims_json = _json.dumps(snapshot, ensure_ascii=False)[:8000]
+    except Exception:
+        dims_json = ""
     now = _now()
     conn.execute(
-        "UPDATE prospects SET audit_score=?, audit_issues=?, audit_strengths=?, updated_at=? WHERE id=?",
-        (score, issues_text, strengths_text, now, pid),
+        "UPDATE prospects SET audit_score=?, audit_issues=?, audit_strengths=?, audit_dims=?, updated_at=? WHERE id=?",
+        (score, issues_text, strengths_text, dims_json, now, pid),
     )
     return True
 
@@ -320,6 +349,7 @@ def mark_read(conn, key) -> bool:
 def record_reply(conn, key, message: str | None = None) -> bool:
     """يسجّل ردّ العميل: يضبط replied_at، ويرقّي الحالة إلى «ردّ» (إن لم تكن متقدّمة).
 
+    إن كان الردّ طلب توقّف (إيقاف/stop/…) يُضبط إلى «موقوف» فورًا (opt-out إلزاميّ).
     لا يُنزل حالة متقدّمة (مهتم/عرض/عميل) إلى «ردّ» — يحترم التقدّم اليدوي.
     """
     pid = _resolve_id(conn, key)
@@ -328,8 +358,14 @@ def record_reply(conn, key, message: str | None = None) -> bool:
     now = _now()
     row = conn.execute("SELECT status FROM prospects WHERE id=? LIMIT 1", (pid,)).fetchone()
     cur_status = (row["status"] if row is not None else None) or "جديد"
-    advanced = ("مهتم", "عرض", "عميل")
-    new_status = cur_status if cur_status in advanced else "ردّ"
+
+    if is_stop_message(message):
+        # طلب توقّف صريح: أوقِف التواصل بغضّ النظر عن الحالة الحالية
+        new_status = "موقوف"
+    else:
+        advanced = ("مهتم", "عرض", "عميل")
+        new_status = cur_status if cur_status in advanced else "ردّ"
+
     if message:
         conn.execute(
             "UPDATE prospects SET status=?, replied_at=?, last_message=?, updated_at=? WHERE id=?",

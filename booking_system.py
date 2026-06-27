@@ -552,6 +552,66 @@ def _load_secret() -> str:
 app = Flask(__name__)
 app.secret_key = _load_secret()
 
+# تحصين كوكي الجلسة. Secure يُفعّل في الإنتاج فقط (HTTPS) حتى لا يكسر التطوير المحلّي عبر http.
+_IS_PROD = bool(os.environ.get("RENDER") or os.environ.get("TURSO_DATABASE_URL")
+                or os.environ.get("BOOKING_SECURE_COOKIES"))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_IS_PROD,
+)
+if not os.environ.get("BOOKING_SECRET") and _IS_PROD:
+    logger.warning("⚠️ BOOKING_SECRET غير مضبوط في الإنتاج — اضبطه كمتغيّر بيئة دائم "
+                   "وإلا تتغيّر المفاتيح عند كل نشر فتنكسر روابط التقارير والجلسات.")
+
+
+def _safe_url(u: str) -> str:
+    """يُرجع الرابط فقط إن كان http/https (يمنع javascript:/data: في href)."""
+    u = (u or "").strip()
+    return u if re.match(r"^https?://", u, re.I) else ""
+
+
+app.jinja_env.filters["safeurl"] = _safe_url
+
+
+# --------------------------------------------------------------------------- #
+# حدّ معدّل خفيف لكل IP (عملية واحدة → ذاكرة كافية): يكبح تخمين X-Owner-Key      #
+# على /api/owner/* و /owner/login، ويحمي المسارات العامّة من الإغراق.           #
+# --------------------------------------------------------------------------- #
+_rate_buckets: dict[str, list] = {}
+
+
+def _client_ip() -> str:
+    return (request.headers.get("X-Forwarded-For", request.remote_addr or "?")
+            .split(",")[0].strip())
+
+
+def _rate_limited(ip: str, limit: int, window: float = 60.0) -> bool:
+    now = time.time()
+    cnt, start = _rate_buckets.get(ip, [0, now])
+    if now - start > window:
+        cnt, start = 0, now
+    cnt += 1
+    _rate_buckets[ip] = [cnt, start]
+    if len(_rate_buckets) > 5000:           # تقليم بسيط لمنع التضخّم
+        for k in list(_rate_buckets)[:1000]:
+            _rate_buckets.pop(k, None)
+    return cnt > limit
+
+
+@app.before_request
+def _global_throttle():
+    p = request.path
+    if not (p.startswith("/api/") or p.startswith("/report") or p == "/go"
+            or p == "/owner/login"):
+        return None
+    # أشدّ على المسارات الحسّاسة (مصادقة/تدميريّة/ويبهوك)، وأوسع على العامّة
+    sensitive = (p.startswith("/api/owner/") or p == "/owner/login"
+                 or p.startswith("/api/wasender/") or p.startswith("/api/crm/"))
+    if _rate_limited(_client_ip(), limit=40 if sensitive else 240, window=60.0):
+        return jsonify({"error": "طلبات كثيرة، حاول لاحقًا"}), 429
+    return None
+
 
 def _biz_or_404(slug):
     biz = get_business(slug)
@@ -670,7 +730,8 @@ def admin_dash(slug):
 def admin_login(slug):
     biz = _biz_or_404(slug)
     pin = (request.form.get("pin") or "").strip()
-    if biz["pin_hash"] and _hash_pin(pin, biz["pin_salt"]) == biz["pin_hash"]:
+    if biz["pin_hash"] and secrets.compare_digest(
+            _hash_pin(pin, biz["pin_salt"]), biz["pin_hash"]):
         session["admin_" + slug] = True
         return redirect(url_for("admin_dash", slug=slug))
     return render_template_string(LOGIN_HTML, b=biz, error="رقم PIN غير صحيح")
@@ -1165,7 +1226,7 @@ def _prospect_token(pid: int) -> str:
     """رمز توقيع قصير لكل عميل (يمنع تخمين/تعداد روابط التقارير)."""
     mac = hmac.new(app.secret_key.encode("utf-8") if isinstance(app.secret_key, str)
                    else app.secret_key, f"report:{pid}".encode("utf-8"), hashlib.sha256)
-    return mac.hexdigest()[:16]
+    return mac.hexdigest()[:32]   # 128 بت (مضاعف القوّة)
 
 
 def _check_token(pid: int, tok: str) -> bool:
@@ -1213,12 +1274,13 @@ def public_report(pid):
     finally:
         conn.close()
 
-    pixel = f"{_public_base()}/api/track/open?id={pid}"
+    tok = _prospect_token(pid)
+    pixel = f"{_public_base()}/api/track/open?id={pid}&t={tok}"
     intl = (prospect.get("whatsapp") or "").strip()
     wa_msg = f"السلام عليكم، بخصوص عرض «واجهة» لـ {prospect.get('name','منشأتنا')}"
     wa_target = (f"https://wa.me/{intl}?text={quote(wa_msg)}" if intl
                  else f"https://wa.me/?text={quote(wa_msg)}")
-    cta = f"{_public_base()}/go?pid={pid}&t={_prospect_token(pid)}&u={quote(wa_target, safe='')}"
+    cta = f"{_public_base()}/go?pid={pid}&t={tok}&u={quote(wa_target, safe='')}"
 
     site = (prospect.get("website") or "").strip()
     if not site:
@@ -1229,18 +1291,42 @@ def public_report(pid):
             cta=html_escape(cta), pixel=f'<img src="{html_escape(pixel)}" width="1" height="1" style="display:none">'),
             mimetype="text/html")
 
-    # لديه موقع: تدقيق حيّ (مع تعويض من المخزّن عند الفشل) ثم تقرير كامل
-    au = audit_site(site)
-    if not au.get("ok") and prospect.get("audit_issues"):
-        au = {"url": site, "ok": True, "score": prospect.get("audit_score") or 0,
-              "dims": {}, "issues": (prospect.get("audit_issues") or "").split(" • "),
-              "strengths": (prospect.get("audit_strengths") or "").split(" • "),
-              "has_booking": False, "has_whatsapp": False, "https": site.startswith("https"),
-              "mobile": False, "title": "", "desc": ""}
+    # لديه موقع: نعرض التدقيق المخزّن (بلا أي جلب شبكيّ حيّ — يمنع استنزاف الخادم).
+    au = _stored_audit(prospect, site)
     business = {"name": prospect.get("name"), "phone": prospect.get("phone"),
                 "website": prospect.get("website")}
     return Response(render_report(business, au, cta_url=cta, pixel_url=pixel),
                     mimetype="text/html")
+
+
+def _stored_audit(prospect: dict, site: str) -> dict:
+    """يبني قاموس تدقيق من اللقطة المخزّنة (audit_dims JSON) — بلا شبكة.
+
+    إن لم يكن العميل قد دُقّق بعد، يُجري تدقيقًا حيًّا مرّة واحدة ويُحفظ للمستقبل.
+    """
+    snap = prospect.get("audit_dims")
+    if snap:
+        try:
+            au = json.loads(snap)
+            au.setdefault("ok", True)
+            au.setdefault("url", site)
+            au.setdefault("dims", {})
+            au.setdefault("issues", (prospect.get("audit_issues") or "").split(" • ") if prospect.get("audit_issues") else [])
+            au.setdefault("strengths", (prospect.get("audit_strengths") or "").split(" • ") if prospect.get("audit_strengths") else [])
+            return au
+        except Exception:
+            pass
+    # لم يُدقَّق بعد: تدقيق حيّ لمرّة واحدة ثم تخزين (لا يتكرّر في الفتحات اللاحقة)
+    au = audit_site(site)
+    try:
+        conn = get_db()
+        with _book_lock:
+            save_audit(conn, prospect.get("id"), au)
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return au
 
 
 def _row_to_dict_safe(row):
@@ -1314,6 +1400,11 @@ def owner_campaign_send():
             if not p:
                 continue
             prospect = _row_to_dict_safe(p)
+            # امتثال opt-out: لا تُرسل لمن أوقف التواصل أو رفض (do-not-contact)
+            if prospect.get("status") in ("موقوف", "مرفوض"):
+                skipped += 1
+                details.append({"id": pid, "skipped": "موقوف/مرفوض (opt-out)"})
+                continue
             # عرض «تقرير» لمن بلا موقع لا معنى له → حوّله لعرض موقع جديد تلقائياً
             eff_offer = offer
             if offer == "report" and not (prospect.get("website") or "").strip():
@@ -1334,7 +1425,7 @@ def owner_campaign_send():
                     skipped += 1
                     details.append({"id": pid, "skipped": "بلا إيميل"})
                     continue
-                pixel = f"{_public_base()}/api/track/open?id={pid}&ch=email"
+                pixel = f"{_public_base()}/api/track/open?id={pid}&ch=email&t={_prospect_token(pid)}"
                 html_body = mailer.text_to_html(message, pixel_url=pixel, cta_url=link,
                                                 cta_label="شاهد العرض")
                 res = mailer.send_email(to, email_subject(prospect, eff_offer),
@@ -1359,13 +1450,14 @@ def owner_campaign_send():
 def _followup_message(prospect: dict, link: str, opened: bool) -> str:
     """رسالة متابعة لطيفة — أدفأ لمن فتح التقرير سابقًا."""
     name = prospect.get("name") or "منشأتكم"
+    optout = "\n\n— للإيقاف ردّوا بكلمة: إيقاف"
     if opened:
         return (f"مرحباً {name} 🙏\n"
                 f"لاحظنا اطّلاعكم على العرض — هل لديكم أي استفسار؟ يسعدنا تفعيله لكم "
-                f"خلال يوم واحد (موقع + حجز واتساب).\n{link}")
+                f"خلال يوم واحد (موقع + حجز واتساب).\n{link}") + optout
     return (f"مرحباً {name} 👋\n"
             f"تذكير لطيف بعرضنا: موقع احترافيّ + حجز عبر واتساب يعمل ٢٤/٧.\n"
-            f"يمكنكم الاطّلاع هنا: {link}\nمتى يناسبكم نشرحه باختصار؟")
+            f"يمكنكم الاطّلاع هنا: {link}\nمتى يناسبكم نشرحه باختصار؟") + optout
 
 
 @app.route("/api/owner/followup/run", methods=["POST"])
@@ -1480,9 +1572,16 @@ def track_open():
     """
     fid = (request.args.get("fid") or "").strip()
     pid = request.args.get("id")
+    tok = request.args.get("t", "")
     is_email = (request.args.get("ch") == "email")
-    if fid or pid:
-        key = int(pid) if (pid and pid.isdigit()) else fid
+    key = None
+    if pid and pid.isdigit():
+        # المسار المعتمد على id يتطلّب توكنًا موقّعًا (يمنع تضخيم العدّادات بالتعداد)
+        if _check_token(int(pid), tok):
+            key = int(pid)
+    elif fid:
+        key = fid   # مسار feature_id القديم (صفحات bizpage الثابتة)
+    if key is not None:
         conn = get_db()
         try:
             with _book_lock:
@@ -1673,7 +1772,9 @@ def _verify_wasender_sig(raw_body: bytes) -> bool:
     """
     secret = os.environ.get("WASENDER_WEBHOOK_SECRET", "").strip()
     if not secret:
-        return True
+        # رفض آمن (fail-closed): بلا سرّ لا نقبل أحداثًا تعدّل القاعدة
+        logger.warning("رُفض ويبهوك: WASENDER_WEBHOOK_SECRET غير مضبوط")
+        return False
     sig = (request.headers.get("X-Webhook-Signature") or "").strip()
     sec_hdr = (request.headers.get("X-Webhook-Secret") or "").strip()
     q = (request.args.get("secret") or "").strip()
@@ -2314,7 +2415,7 @@ td .mini{font-size:11px;color:#9aa5b1}
 <tr>
   <td><input type="checkbox" class="rowchk" value="{{ p['id'] }}" onclick="updSel()" style="width:auto"></td>
   <td><strong>{{ p['name'] }}</strong><div class="mini">{{ p['category'] }}{% if p['city'] %} · {{ p['city'] }}{% endif %}</div></td>
-  <td>{% if p['website'] %}<a href="{{ p['website'] }}" target="_blank">موقع</a>{% else %}<span style="color:#ea4335">بلا موقع</span>{% endif %}</td>
+  <td>{% if p['website']|safeurl %}<a href="{{ p['website']|safeurl }}" target="_blank" rel="noopener nofollow">موقع</a>{% elif p['website'] %}<span class="muted">{{ p['website'][:30] }}</span>{% else %}<span style="color:#ea4335">بلا موقع</span>{% endif %}</td>
   <td>{% set s=p['audit_score'] %}
     {% if s is none %}<span class="sc na">—</span>
     {% elif s>=70 %}<span class="sc hi">{{ s }}</span>

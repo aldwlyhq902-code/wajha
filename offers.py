@@ -112,6 +112,8 @@ def build_message(prospect: dict, offer: str, report_link: str = "",
     services = whatsbot_services(category)
     services_block = "\n".join(f"• {s}" for s in services[:4])
 
+    optout = "\n\n— للإيقاف ردّوا بكلمة: إيقاف"
+
     if offer == "report":
         head = (
             f"مرحباً {name} 👋\n"
@@ -123,7 +125,7 @@ def build_message(prospect: dict, offer: str, report_link: str = "",
             f"\n\nومع تطوير الموقع نضيف *مساعد واتساب آليّ (whats_bot)*:\n{services_block}\n\n"
             f"نسعد بشرحها لكم خلال دقيقتين. متى يناسبكم؟ — فريق {brand}"
         )
-        return head + link_line + tail
+        return head + link_line + tail + optout
 
     # newsite (الافتراضي لمن بلا موقع)
     head = (
@@ -134,7 +136,7 @@ def build_message(prospect: dict, offer: str, report_link: str = "",
     body = f"\n{services_block}"
     link_line = f"\n\n👀 نموذج جاهز لمنشأتكم: {report_link}" if report_link else ""
     tail = f"\n\nنفعّلها باسمكم خلال يوم واحد. نسعد بخدمتكم — فريق {brand}"
-    return head + body + link_line + tail
+    return head + body + link_line + tail + optout
 
 
 def email_subject(prospect: dict, offer: str) -> str:

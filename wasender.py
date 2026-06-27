@@ -30,6 +30,11 @@ logger = logging.getLogger("wasender")
 SEND_URL = "https://www.wasenderapi.com/api/send-message"
 STATUS_URL = "https://www.wasenderapi.com/api/status"
 
+# واجهة المستخدم: WaSenderAPI خلف Cloudflare يحجب UA الافتراضي لـ urllib بخطأ 1010
+# (Browser Integrity Check). إرسال UA متصفّح حقيقيّ يتجاوز الحجب.
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
 # أماكن قراءة مفتاح الـ API (بالترتيب): الوسيط → متغيّر البيئة → ملف مفتاح
 KEY_FILES = ("wasender.key", "booking_data/.wasender_key")
 
@@ -95,7 +100,9 @@ class WaSenderClient:
             req = urllib.request.Request(
                 self.send_url, data=data, method="POST",
                 headers={"Authorization": f"Bearer {self.api_key}",
-                         "Content-Type": "application/json"},
+                         "Content-Type": "application/json",
+                         "Accept": "application/json",
+                         "User-Agent": _UA},
             )
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -150,7 +157,8 @@ class WaSenderClient:
         if not self.api_key:
             return {"ok": False, "error": "لا يوجد مفتاح"}
         req = urllib.request.Request(
-            STATUS_URL, headers={"Authorization": f"Bearer {self.api_key}"})
+            STATUS_URL, headers={"Authorization": f"Bearer {self.api_key}",
+                                 "Accept": "application/json", "User-Agent": _UA})
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return {"ok": True, "raw": json.loads(resp.read().decode("utf-8"))}

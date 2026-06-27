@@ -1538,7 +1538,37 @@ def _msg_text(msg: dict) -> str:
             cap = (m.get(k) or {}).get("caption") if isinstance(m.get(k), dict) else None
             if cap:
                 return str(cap)[:300]
-    return str(msg.get("text") or msg.get("body") or "")[:300]
+    return str(msg.get("messageBody") or msg.get("text") or msg.get("body") or "")[:300]
+
+
+def _event_phone(*objs) -> str:
+    """يستخرج رقم الهاتف الحقيقيّ من حدث واتساب.
+
+    في وضع الخصوصيّة الجديد (addressingMode=lid) يكون remoteJid معرّفًا LID
+    (مثل 96379217137770@lid) وليس رقمًا. الرقم الحقيقيّ في senderPn/cleanedSenderPn.
+    لذا نفضّلهما، ونتجاهل أي قيمة LID.
+    """
+    # 1) الحقول التي تحمل رقمًا حقيقيًّا صراحةً
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for fld in ("cleanedSenderPn", "senderPn", "participantPn", "senderPhone"):
+            v = obj.get(fld)
+            if v and "lid" not in str(v).lower():
+                d = _jid_digits(v)
+                if d:
+                    return d
+    # 2) remoteJid/from/… ما لم تكن LID
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for fld in ("remoteJid", "from", "to", "jid", "participant"):
+            v = obj.get(fld)
+            if v and "@lid" not in str(v):
+                d = _jid_digits(v)
+                if d:
+                    return d
+    return ""
 
 
 def _parse_wasender_events(body: dict) -> list[dict]:
@@ -1567,11 +1597,15 @@ def _parse_wasender_events(body: dict) -> list[dict]:
     is_msg_event = (not is_status_event) and (
         "upsert" in event or "received" in event or event in ("message", "messages"))
 
-    # 1) رسائل واردة (messages.upsert / received) — وليست تحديث حالة
+    # 1) رسائل واردة (messages.upsert / received) — وليست تحديث حالة.
+    #    data.messages قد يكون قائمة أو كائنًا مفردًا (WaSenderAPI يرسله مفردًا).
     msgs = None
     if not is_status_event:
-        if isinstance(data, dict) and isinstance(data.get("messages"), list):
-            msgs = data["messages"]
+        mm = data.get("messages") if isinstance(data, dict) else None
+        if isinstance(mm, list):
+            msgs = mm
+        elif isinstance(mm, dict):
+            msgs = [mm]
         elif is_msg_event:
             if isinstance(data, list):
                 msgs = data
@@ -1583,8 +1617,7 @@ def _parse_wasender_events(body: dict) -> list[dict]:
                 continue
             key = msg.get("key") or {}
             from_me = key.get("fromMe", msg.get("fromMe", False))
-            jid = key.get("remoteJid") or msg.get("from") or msg.get("remoteJid") or ""
-            phone = _jid_digits(jid)
+            phone = _event_phone(key, msg)   # الرقم الحقيقيّ (يتجاوز LID)
             if not phone:
                 continue
             if not from_me:   # رسالة من العميل = ردّ
@@ -1602,9 +1635,7 @@ def _parse_wasender_events(body: dict) -> list[dict]:
             if not isinstance(up, dict):
                 continue
             key = up.get("key") or {}
-            jid = (key.get("remoteJid") or up.get("remoteJid") or up.get("jid")
-                   or up.get("to") or up.get("from") or "")
-            phone = _jid_digits(jid)
+            phone = _event_phone(key, up)   # الرقم الحقيقيّ (يتجاوز LID)
             status = (up.get("update") or {}).get("status") if isinstance(up.get("update"), dict) else up.get("status")
             kind = _status_kind(status)
             # حدث message-receipt.update يحمل receipt بطوابع قراءة/تسليم بدل status

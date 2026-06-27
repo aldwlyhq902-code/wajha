@@ -590,20 +590,44 @@ async function saveToCloud() {
     });
     const d = await resp.json();
     if (!resp.ok) { alert("تعذّر الحفظ: " + (d.error || "خطأ")); return; }
-    // افتح موقع نظام الحجز تلقائياً بعد الحفظ
+    // لا نفتح نافذة منبثقة تلقائياً (يحجبها المتصفّح) — نعرض لوحة نجاح فيها زر للانتقال
     const site = (d.cloud_url || cloud_url || "").replace(/\/$/, "");
-    if (site) window.open(site + "/owner", "_blank");
-    let msg = `✓ حُفظ في القاعدة: أُضيف ${d.added} • تخطّي ${d.skipped} (مكرّرة)`;
-    if (d.businesses && d.businesses.length) {
-      msg += "\n\nأرقام PIN (احفظها لتسليمها للمنشآت):\n" +
-        d.businesses.map(b => `• ${b.name} — PIN ${b.pin}`).join("\n");
-    }
-    alert(msg + "\n\n(فُتح موقع النظام في تبويب جديد)");
+    showCloudSuccess(site, d);
   } catch (e) {
     alert("فشل الاتصال بالخادم المحلي: " + e.message);
   } finally {
     btn.disabled = false; btn.textContent = orig;
   }
+}
+
+// لوحة نجاح الحفظ: زر بارز للانتقال إلى «شاشة الاستهداف والتحليل» (نقر المستخدم لا يحجبه المتصفّح)
+function showCloudSuccess(site, d) {
+  const prospects = (d.prospects != null) ? d.prospects : (d.added || 0);
+  let pins = "";
+  if (d.businesses && d.businesses.length) {
+    pins = '<div style="margin-top:10px;font-size:13px;color:#5b6b7b">أرقام PIN (احفظها لتسليمها للمنشآت):<br>' +
+      d.businesses.map(b => `• ${b.name} — <b>PIN ${b.pin}</b>`).join("<br>") + '</div>';
+  }
+  const targetUrl = site ? (site + "/owner/crm") : "#";
+  let old = document.getElementById("cloud-success");
+  if (old) old.remove();
+  const ov = document.createElement("div");
+  ov.id = "cloud-success";
+  ov.style.cssText = "position:fixed;inset:0;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;z-index:9999";
+  ov.innerHTML =
+    '<div style="background:#fff;border-radius:18px;padding:26px 28px;max-width:440px;width:92%;box-shadow:0 20px 60px rgba(0,0,0,.3);text-align:center;font-family:inherit">' +
+      '<div style="font-size:40px">✅</div>' +
+      '<h2 style="margin:6px 0 4px;color:#0f172a">تم الحفظ في القاعدة</h2>' +
+      `<p style="color:#64748b;margin-bottom:14px">أُضيف <b>${d.added}</b> منشأة · تخطّي <b>${d.skipped}</b> (مكرّرة)` +
+        `<br>جاهز للاستهداف: <b>${prospects}</b> عميل محتمل</p>` +
+      (site
+        ? `<a href="${targetUrl}" target="_blank" rel="noopener" style="display:block;background:#128C7E;color:#fff;text-decoration:none;font-weight:800;font-size:17px;padding:14px;border-radius:12px;margin-bottom:8px">🎯 انتقل إلى شاشة الاستهداف والتحليل ←</a>`
+        : '<p style="color:#ea4335">لم يُضبط رابط القاعدة السحابية.</p>') +
+      pins +
+      '<button onclick="document.getElementById(\'cloud-success\').remove()" style="margin-top:14px;background:#eef1f4;color:#3b4a5a;border:0;border-radius:10px;padding:10px 18px;font-weight:700;cursor:pointer;font-family:inherit">إغلاق</button>' +
+    '</div>';
+  ov.addEventListener("click", e => { if (e.target === ov) ov.remove(); });
+  document.body.appendChild(ov);
 }
 
 // أعد ضبط حالة الفرز والفلاتر حتى لا تتسرّب إلى بحث جديد

@@ -456,8 +456,13 @@ def _phased_plan(audit: dict) -> list[tuple[str, str, list[str]]]:
     ]
 
 
-def render_report(business: dict, audit: dict, brand: str = "واجهة") -> str:
-    """يولّد صفحة HTML عربية RTL مستقلّة (noindex) كتقرير تدقيق + عرض خدمتين."""
+def render_report(business: dict, audit: dict, brand: str = "واجهة",
+                  cta_url: str | None = None, pixel_url: str | None = None) -> str:
+    """يولّد صفحة HTML عربية RTL مستقلّة (noindex) كتقرير تدقيق + عرض خدمتين.
+
+    cta_url   : إن مُرّر، يُستخدم لزر «تواصل عبر واتساب» (مثلاً رابط /go لتتبّع النقر).
+    pixel_url : إن مُرّر، يُحقَن بكسل تتبّع شفّاف 1×1 لرصد فتح التقرير.
+    """
     business = business or {}
     audit = audit or {}
     name = business.get("name") or "منشأتك"
@@ -470,8 +475,10 @@ def render_report(business: dict, audit: dict, brand: str = "واجهة") -> str
     intl = normalize_phone(business.get("phone") or business.get("whatsapp"))
     wa_msg = (f"السلام عليكم، شاهدت تقرير موقع «{name}» من {brand} "
               f"(الدرجة {score}/100) وأرغب بتطويره وإضافة الحجز عبر واتساب.")
-    wa_link = (f"https://wa.me/{intl}?text={quote(wa_msg)}"
-               if intl else f"https://wa.me/?text={quote(wa_msg)}")
+    wa_link = cta_url or (f"https://wa.me/{intl}?text={quote(wa_msg)}"
+                          if intl else f"https://wa.me/?text={quote(wa_msg)}")
+    pixel_tag = (f'<img src="{_e(pixel_url)}" width="1" height="1" alt="" '
+                 f'style="position:absolute;left:-9999px">' if pixel_url else "")
 
     # نقاط القوة (٣) والمشاكل (حتى ٥)
     strengths = (audit.get("strengths") or [])[:3]
@@ -661,6 +668,7 @@ def render_report(business: dict, audit: dict, brand: str = "واجهة") -> str
   </div>
 
 </div>
+{pixel_tag}
 </body>
 </html>"""
 

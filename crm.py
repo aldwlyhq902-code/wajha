@@ -51,10 +51,31 @@ def _now() -> str:
 
 # الأعمدة القابلة للكتابة من قِبل المستخدم عند الإدراج/التحديث
 _PROSPECT_FIELDS = (
-    "feature_id", "name", "phone", "whatsapp", "category", "city", "source",
-    "website", "audit_score", "status", "last_message", "report_url", "notes",
-    "last_contacted_at",
+    "feature_id", "name", "phone", "whatsapp", "email", "category", "city", "source",
+    "website", "audit_score", "audit_issues", "audit_strengths", "status",
+    "last_message", "report_url", "notes", "last_contacted_at",
+    "is_target", "target_rank", "channel",
 )
+
+# أعمدة إضافية تُدار عبر دوال مخصّصة (تتبّع/تدقيق/استهداف) — تُضاف بالترحيل إن غابت.
+# (name -> SQL declaration)
+_EXTRA_COLUMNS = {
+    "email": "TEXT",
+    "audit_issues": "TEXT",
+    "audit_strengths": "TEXT",
+    "is_target": "INTEGER DEFAULT 0",
+    "target_rank": "INTEGER",
+    "channel": "TEXT",
+    "opens": "INTEGER DEFAULT 0",
+    "last_open_at": "TEXT",
+    "clicks": "INTEGER DEFAULT 0",
+    "last_click_at": "TEXT",
+    "delivered_at": "TEXT",
+    "read_at": "TEXT",
+    "replied_at": "TEXT",
+    "email_opens": "INTEGER DEFAULT 0",
+    "last_email_open_at": "TEXT",
+}
 
 
 def _row_to_dict(row) -> dict | None:
@@ -86,18 +107,31 @@ def ensure_prospects_table(conn) -> None:
         " name TEXT,"
         " phone TEXT,"
         " whatsapp TEXT,"
+        " email TEXT,"
         " category TEXT,"
         " city TEXT,"
         " source TEXT,"
         " website TEXT,"
         " audit_score INTEGER,"
+        " audit_issues TEXT,"
+        " audit_strengths TEXT,"
         " status TEXT DEFAULT 'جديد',"
         " last_message TEXT,"
         " report_url TEXT,"
         " notes TEXT,"
         " last_contacted_at TEXT,"
+        " is_target INTEGER DEFAULT 0,"
+        " target_rank INTEGER,"
+        " channel TEXT,"
         " opens INTEGER DEFAULT 0,"
         " last_open_at TEXT,"
+        " clicks INTEGER DEFAULT 0,"
+        " last_click_at TEXT,"
+        " delivered_at TEXT,"
+        " read_at TEXT,"
+        " replied_at TEXT,"
+        " email_opens INTEGER DEFAULT 0,"
+        " last_email_open_at TEXT,"
         " created_at TEXT,"
         " updated_at TEXT"
         ")"
@@ -108,13 +142,12 @@ def ensure_prospects_table(conn) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospects_status ON prospects(status)"
     )
-    # ترحيل الجداول القديمة: أضِف أعمدة تتبّع الفتح إن غابت
+    # ترحيل الجداول القديمة: أضِف أي عمود حديث غائب (تتبّع/تدقيق/استهداف/إيميل)
     try:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(prospects)").fetchall()}
-        if "opens" not in cols:
-            conn.execute("ALTER TABLE prospects ADD COLUMN opens INTEGER DEFAULT 0")
-        if "last_open_at" not in cols:
-            conn.execute("ALTER TABLE prospects ADD COLUMN last_open_at TEXT")
+        for col, decl in _EXTRA_COLUMNS.items():
+            if col not in cols:
+                conn.execute(f"ALTER TABLE prospects ADD COLUMN {col} {decl}")
     except Exception:
         pass
 
@@ -138,6 +171,175 @@ def record_open(conn, key) -> bool:
         "UPDATE prospects SET opens=COALESCE(opens,0)+1, last_open_at=?, updated_at=? WHERE id=?",
         (now, now, target_id),
     )
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# محلّل المفتاح المشترك (id / feature_id / phone)                              #
+# --------------------------------------------------------------------------- #
+def _resolve_id(conn, key):
+    """يحوّل مفتاحاً (id رقمي أو feature_id/phone نصّي) إلى id السجل، أو None."""
+    if key is None:
+        return None
+    if isinstance(key, int):
+        row = conn.execute("SELECT id FROM prospects WHERE id=? LIMIT 1", (key,)).fetchone()
+        return row["id"] if row is not None else None
+    skey = str(key).strip() or None
+    if skey is None:
+        return None
+    if skey.isdigit():
+        row = conn.execute("SELECT id FROM prospects WHERE id=? LIMIT 1", (int(skey),)).fetchone()
+        if row is not None:
+            return row["id"]
+    ex = _find_existing(conn, skey, skey)
+    return ex["id"] if ex is not None else None
+
+
+# --------------------------------------------------------------------------- #
+# حفظ نتيجة تدقيق الموقع (الدرجة + الملاحظات النصية + نقاط القوة)               #
+# --------------------------------------------------------------------------- #
+def save_audit(conn, prospect_id, audit: dict) -> bool:
+    """يخزّن نتيجة audit_site لعميل: الدرجة، ونصّ المشاكل، ونصّ نقاط القوة.
+
+    `audit` هو ناتج audit.audit_site (فيه score/issues/strengths). يُعيد True عند النجاح.
+    """
+    pid = _resolve_id(conn, prospect_id)
+    if pid is None:
+        return False
+    audit = audit or {}
+    score = audit.get("score")
+    issues = audit.get("issues") or []
+    strengths = audit.get("strengths") or []
+    issues_text = " • ".join(str(x) for x in issues)[:2000] if issues else ""
+    strengths_text = " • ".join(str(x) for x in strengths)[:2000] if strengths else ""
+    now = _now()
+    conn.execute(
+        "UPDATE prospects SET audit_score=?, audit_issues=?, audit_strengths=?, updated_at=? WHERE id=?",
+        (score, issues_text, strengths_text, now, pid),
+    )
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# الاستهداف: تعليم/إلغاء «مُستهدَف» + ترتيب الأولوية                            #
+# --------------------------------------------------------------------------- #
+def set_target(conn, ids, on: bool = True) -> int:
+    """يضبط علم is_target لقائمة معرّفات. يُعيد عدد الصفوف المتأثّرة."""
+    if isinstance(ids, (int, str)):
+        ids = [ids]
+    now = _now()
+    n = 0
+    for key in ids:
+        pid = _resolve_id(conn, key)
+        if pid is None:
+            continue
+        conn.execute(
+            "UPDATE prospects SET is_target=?, updated_at=? WHERE id=?",
+            (1 if on else 0, now, pid),
+        )
+        n += 1
+    return n
+
+
+def rank_targets(conn) -> int:
+    """يرتّب العملاء المُستهدَفين بالأولوية ويكتب target_rank (1 = الأعلى أولوية).
+
+    الأولوية: الأكثر حاجةً أولاً = (بلا موقع) ثم أدنى درجة تدقيق، ثم الأكثر مراجعات
+    (سمعة قوية غير مستثمَرة). نُرتّب ونكتب رقماً تسلسلياً. يُعيد عدد المُستهدَفين.
+    """
+    rows = conn.execute(
+        "SELECT id, audit_score, website FROM prospects WHERE is_target=1"
+    ).fetchall()
+    items = [_row_to_dict(r) for r in rows]
+
+    def _key(p):
+        has_site = 1 if (p.get("website") or "").strip() else 0
+        score = p.get("audit_score")
+        score = 999 if score is None else score   # غير مُدقّق → آخر الأولوية حتى يُدقّق
+        return (has_site, score)
+
+    items.sort(key=_key)
+    now = _now()
+    for i, p in enumerate(items, 1):
+        conn.execute(
+            "UPDATE prospects SET target_rank=?, updated_at=? WHERE id=?",
+            (i, now, p["id"]),
+        )
+    return len(items)
+
+
+# --------------------------------------------------------------------------- #
+# تتبّع التفاعل: نقر الرابط، فتح الإيميل، التسليم/القراءة، الردّ                #
+# --------------------------------------------------------------------------- #
+def record_click(conn, key) -> bool:
+    """يزيد عدّاد نقر الرابط لعميل."""
+    pid = _resolve_id(conn, key)
+    if pid is None:
+        return False
+    now = _now()
+    conn.execute(
+        "UPDATE prospects SET clicks=COALESCE(clicks,0)+1, last_click_at=?, updated_at=? WHERE id=?",
+        (now, now, pid),
+    )
+    return True
+
+
+def record_email_open(conn, key) -> bool:
+    """يزيد عدّاد فتح الإيميل لعميل."""
+    pid = _resolve_id(conn, key)
+    if pid is None:
+        return False
+    now = _now()
+    conn.execute(
+        "UPDATE prospects SET email_opens=COALESCE(email_opens,0)+1, last_email_open_at=?, updated_at=? WHERE id=?",
+        (now, now, pid),
+    )
+    return True
+
+
+def mark_delivered(conn, key) -> bool:
+    """يسجّل وقت تسليم الرسالة (من webhook المزوّد)."""
+    pid = _resolve_id(conn, key)
+    if pid is None:
+        return False
+    now = _now()
+    conn.execute("UPDATE prospects SET delivered_at=?, updated_at=? WHERE id=?", (now, now, pid))
+    return True
+
+
+def mark_read(conn, key) -> bool:
+    """يسجّل وقت قراءة الرسالة (من webhook المزوّد)."""
+    pid = _resolve_id(conn, key)
+    if pid is None:
+        return False
+    now = _now()
+    conn.execute("UPDATE prospects SET read_at=?, updated_at=? WHERE id=?", (now, now, pid))
+    return True
+
+
+def record_reply(conn, key, message: str | None = None) -> bool:
+    """يسجّل ردّ العميل: يضبط replied_at، ويرقّي الحالة إلى «ردّ» (إن لم تكن متقدّمة).
+
+    لا يُنزل حالة متقدّمة (مهتم/عرض/عميل) إلى «ردّ» — يحترم التقدّم اليدوي.
+    """
+    pid = _resolve_id(conn, key)
+    if pid is None:
+        return False
+    now = _now()
+    row = conn.execute("SELECT status FROM prospects WHERE id=? LIMIT 1", (pid,)).fetchone()
+    cur_status = (row["status"] if row is not None else None) or "جديد"
+    advanced = ("مهتم", "عرض", "عميل")
+    new_status = cur_status if cur_status in advanced else "ردّ"
+    if message:
+        conn.execute(
+            "UPDATE prospects SET status=?, replied_at=?, last_message=?, updated_at=? WHERE id=?",
+            (new_status, now, str(message)[:300], now, pid),
+        )
+    else:
+        conn.execute(
+            "UPDATE prospects SET status=?, replied_at=?, updated_at=? WHERE id=?",
+            (new_status, now, now, pid),
+        )
     return True
 
 
@@ -226,10 +428,14 @@ def upsert_prospect(conn, data: dict) -> dict:
         tuple(params),
     )
     new_id = getattr(cur, "lastrowid", None)
-    if new_id is None:
-        # احتياط لبعض الواجهات: استرجع عبر feature_id/phone
+    if not new_id:
+        # بعض الواجهات (مثل libsql عبر بعض النقل) تُعيد lastrowid=0/None — استرجع بالمفتاح
         fetched = _find_existing(conn, feature_id, phone)
-        return _row_to_dict(fetched)
+        if fetched is not None:
+            return _row_to_dict(fetched)
+        # أو بآخر سجلّ مُدرَج (احتياط أخير)
+        last = conn.execute("SELECT * FROM prospects ORDER BY id DESC LIMIT 1").fetchone()
+        return _row_to_dict(last)
     return _get_by_id(conn, new_id)
 
 
@@ -306,17 +512,21 @@ def set_status(conn, prospect_id, status, notes=None) -> bool:
 # --------------------------------------------------------------------------- #
 # الاستعلام                                                                    #
 # --------------------------------------------------------------------------- #
-def list_prospects(conn, status=None, q=None) -> list[dict]:
+def list_prospects(conn, status=None, q=None, sort=None, only_targets=False) -> list[dict]:
     """يُعيد قائمة العملاء المحتملين، مع فلترة اختيارية بالحالة و/أو نص بحث.
 
     `q` يبحث في name و phone و category و city (تطابق جزئي LIKE).
-    الترتيب: الأحدث تحديثاً أولاً.
+    `sort`: None=الأحدث (افتراضي)، "score"=الأدنى درجةً أولاً (الأكثر حاجة)،
+            "rank"=ترتيب الاستهداف، "opens"=الأكثر تفاعلاً.
+    `only_targets`: True يقصر النتيجة على المُستهدَفين (is_target=1).
     """
     where = []
     params: list = []
     if status:
         where.append("status=?")
         params.append(status)
+    if only_targets:
+        where.append("is_target=1")
     if q:
         like = f"%{q}%"
         where.append(
@@ -326,7 +536,15 @@ def list_prospects(conn, status=None, q=None) -> list[dict]:
     sql = "SELECT * FROM prospects"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY (updated_at IS NULL), updated_at DESC, id DESC"
+    if sort == "score":
+        # الأدنى درجةً أولاً (الأكثر حاجة)؛ غير المُدقّق (NULL) في النهاية
+        sql += " ORDER BY (audit_score IS NULL), audit_score ASC, id DESC"
+    elif sort == "rank":
+        sql += " ORDER BY (target_rank IS NULL), target_rank ASC, id DESC"
+    elif sort == "opens":
+        sql += " ORDER BY COALESCE(opens,0)+COALESCE(clicks,0) DESC, id DESC"
+    else:
+        sql += " ORDER BY (updated_at IS NULL), updated_at DESC, id DESC"
     rows = conn.execute(sql, tuple(params)).fetchall()
     return [_row_to_dict(r) for r in rows]
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -38,7 +39,9 @@ import threading
 import time
 from datetime import datetime, date as date_cls, timedelta
 from email.mime.text import MIMEText
+from html import escape as html_escape
 from pathlib import Path
+from urllib.parse import quote
 
 from flask import (
     Flask, request, session, redirect, url_for,
@@ -50,11 +53,16 @@ from leads import normalize_phone, whatsappable, load_records
 
 # وحدات منصّة النمو (بُنيت متوازية): CRM، تدقيق المواقع، التسعير، التقارير، جسر whats_bot
 from crm import (ensure_prospects_table, upsert_prospect, mark_sent, record_open,
-                 set_status as crm_set_status, list_prospects, stats_by_status, STATUSES)
+                 set_status as crm_set_status, list_prospects, stats_by_status, STATUSES,
+                 save_audit, set_target, rank_targets, record_click, record_email_open,
+                 mark_delivered, mark_read, record_reply)
 from audit import audit_site, render_report
 from pricing import suggest_plan
 from reports import compute_stats, render_dashboard
 from whatsbot_bridge import handoff_prospect
+from offers import build_message, email_subject
+import mailer
+from wasender import WaSenderClient, to_e164, load_api_key as _wasender_key
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -113,10 +121,49 @@ def _split_sql(script: str) -> list[str]:
     return [s.strip() for s in script.split(";") if s.strip()]
 
 
+class _LibsqlRow:
+    """صفّ شبيه بـ sqlite3.Row فوق صفّ libsql: يدعم الوصول بالاسم والفهرس و keys().
+
+    ضروريّ لأن بعض إصدارات libsql_client تُعيد صفوفًا بلا .keys()، فتنكسر الشيفرة
+    التي تتوقّع واجهة sqlite3.Row (مثل crm._row_to_dict). نوحّد السلوك عبر كل النقل.
+    """
+    __slots__ = ("_cols", "_vals", "_map")
+
+    def __init__(self, cols, vals):
+        self._cols = cols
+        self._vals = vals
+        self._map = {c: i for i, c in enumerate(cols)}
+
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return self._vals[k]
+        return self._vals[self._map[k]]
+
+    def keys(self):
+        return list(self._cols)
+
+    def get(self, k, default=None):
+        i = self._map.get(k)
+        return self._vals[i] if i is not None else default
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __contains__(self, k):
+        return k in self._map
+
+
 class _LibsqlCursor:
     """واجهة شبيهة بمؤشّر sqlite3 فوق نتيجة libsql_client."""
     def __init__(self, rs=None):
-        self._rows = list(rs.rows) if rs is not None else []
+        if rs is not None:
+            cols = list(getattr(rs, "columns", []) or [])
+            self._rows = [_LibsqlRow(cols, list(r)) for r in rs.rows]
+        else:
+            self._rows = []
         self.rowcount = getattr(rs, "rows_affected", -1) if rs is not None else -1
         self.lastrowid = getattr(rs, "last_insert_rowid", None) if rs is not None else None
         self._i = 0
@@ -843,11 +890,39 @@ def owner_import():
         return jsonify({"error": "صيغة غير متوقعة (المتوقع قائمة منشآت)"}), 400
     results = import_records(data, "966")
     added = [r for r in results if r["added"]]
+    # غذِّ مسار الاستهداف/المتابعة (prospects) بنفس عملية الحفظ — حتى تظهر في شاشة الاستهداف
+    prospects_added = _feed_prospects(data)
     return jsonify({
         "added": len(added),
         "skipped": len(results) - len(added),
+        "prospects": prospects_added,
         "businesses": [{"name": r["name"], "slug": r["slug"], "pin": r.get("pin")} for r in added],
     })
+
+
+def _feed_prospects(records) -> int:
+    """يُدرج/يحدّث سجلّات السحب في جدول prospects (مسار الاستهداف). يُعيد عدد الجدد."""
+    conn = get_db()
+    try:
+        before = conn.execute("SELECT COUNT(*) AS c FROM prospects").fetchone()["c"]
+        for r in records:
+            if not isinstance(r, dict) or not r.get("name"):
+                continue
+            intl = normalize_phone(r.get("phone"), "966")
+            wa = intl if (intl and whatsappable(intl, r.get("phone"), "966")) else ""
+            with _book_lock:
+                upsert_prospect(conn, {
+                    "feature_id": _feat_id(r.get("place_url", "")),
+                    "name": r.get("name", ""), "phone": r.get("phone", ""),
+                    "whatsapp": wa, "email": (r.get("email") or "").strip(),
+                    "category": r.get("category", ""), "city": r.get("city", ""),
+                    "website": r.get("website", ""), "source": "خرائط Google",
+                })
+        conn.commit()
+        after = conn.execute("SELECT COUNT(*) AS c FROM prospects").fetchone()["c"]
+    finally:
+        conn.close()
+    return after - before
 
 
 # --------------------------------------------------------------------------- #
@@ -866,13 +941,36 @@ def _feat_id(url):
 def owner_crm():
     if not is_owner():
         return redirect(url_for("owner_dash"))
+    sort = request.args.get("sort") or None
+    only_targets = request.args.get("targets") in ("1", "true", "yes")
     conn = get_db()
     try:
-        prospects = list_prospects(conn)
+        prospects = list_prospects(conn, sort=sort, only_targets=only_targets)
         stats = stats_by_status(conn)
+        funnel = _funnel_counts(conn)
     finally:
         conn.close()
-    return render_template_string(CRM_HTML, prospects=prospects, stats=stats, statuses=STATUSES)
+    return render_template_string(CRM_HTML, prospects=prospects, stats=stats,
+                                  statuses=STATUSES, funnel=funnel,
+                                  sort=(sort or ""), only_targets=only_targets)
+
+
+def _funnel_counts(conn) -> dict:
+    """عدّادات القمع للعرض البصري: مُستهدَف → أُرسل → فُتح → نُقر → ردّ → عميل."""
+    def _c(sql, params=()):
+        try:
+            return conn.execute(sql, params).fetchone()["c"] or 0
+        except Exception:
+            return 0
+    return {
+        "total":   _c("SELECT COUNT(*) AS c FROM prospects"),
+        "targets": _c("SELECT COUNT(*) AS c FROM prospects WHERE is_target=1"),
+        "sent":    _c("SELECT COUNT(*) AS c FROM prospects WHERE last_contacted_at IS NOT NULL"),
+        "opened":  _c("SELECT COUNT(*) AS c FROM prospects WHERE COALESCE(opens,0)>0 OR COALESCE(email_opens,0)>0"),
+        "clicked": _c("SELECT COUNT(*) AS c FROM prospects WHERE COALESCE(clicks,0)>0"),
+        "replied": _c("SELECT COUNT(*) AS c FROM prospects WHERE status IN ('ردّ','مهتم','عرض','عميل')"),
+        "customer": _c("SELECT COUNT(*) AS c FROM prospects WHERE status='عميل'"),
+    }
 
 
 @app.route("/api/owner/prospects/import", methods=["POST"])
@@ -959,12 +1057,364 @@ def owner_prospect_audit(pid):
                 "هذه المنشأة <b>بلا موقع</b> — اعرض خدمة بناء موقع + حجز عبر واتساب 💬</div>",
                 mimetype="text/html")
         au = audit_site(site)
-        conn.execute("UPDATE prospects SET audit_score=?, updated_at=? WHERE id=?",
-                     (au.get("score"), datetime.now().isoformat(timespec="seconds"), pid))
-        conn.commit()
+        with _book_lock:
+            save_audit(conn, pid, au)   # يخزّن الدرجة + نصّ المشاكل + نقاط القوة
+            conn.commit()
     finally:
         conn.close()
     return Response(render_report(business, au), mimetype="text/html")
+
+
+@app.route("/api/owner/prospects/audit", methods=["POST"])
+def owner_prospects_bulk_audit():
+    """تدقيق جماعي: {ids:[...]} → يدقّق موقع كل عميل، يخزّن الدرجة والملاحظات. يُعيد ملخّصاً."""
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    ids = f.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "لم تُحدَّد عملاء"}), 400
+    conn = get_db()
+    results = []
+    audited = no_site = failed = 0
+    try:
+        for raw in ids[:60]:   # حدّ أقصى للأمان في الطلب الواحد
+            try:
+                pid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            p = _get_prospect(conn, pid)
+            if not p:
+                continue
+            site = (p["website"] or "").strip()
+            if not site:
+                no_site += 1
+                with _book_lock:
+                    # بلا موقع: درجة 0 وملاحظة واضحة (فرصة بناء موقع جديد)
+                    save_audit(conn, pid, {"score": 0,
+                                           "issues": ["لا يملك موقعاً إلكترونياً — فرصة بناء موقع + حجز واتساب."],
+                                           "strengths": []})
+                    conn.commit()
+                results.append({"id": pid, "name": p["name"], "score": 0, "no_site": True})
+                continue
+            try:
+                au = audit_site(site)
+                with _book_lock:
+                    save_audit(conn, pid, au)
+                    conn.commit()
+                audited += 1
+                results.append({"id": pid, "name": p["name"], "score": au.get("score"),
+                                "issues": len(au.get("issues") or [])})
+            except Exception as e:
+                failed += 1
+                results.append({"id": pid, "name": p["name"], "error": str(e)[:80]})
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "audited": audited, "no_site": no_site,
+                    "failed": failed, "results": results})
+
+
+@app.route("/api/owner/prospects/target", methods=["POST"])
+def owner_prospects_target():
+    """تعليم/إلغاء «مُستهدَف» لمجموعة: {ids:[...], on:true|false}."""
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    ids = f.get("ids") or []
+    on = bool(f.get("on", True))
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "لم تُحدَّد عملاء"}), 400
+    conn = get_db()
+    try:
+        with _book_lock:
+            n = set_target(conn, [int(x) for x in ids if str(x).isdigit()], on)
+            rank_targets(conn)   # أعد الترتيب بعد كل تغيير في الاستهداف
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "updated": n})
+
+
+@app.route("/api/owner/prospects/rank", methods=["POST"])
+def owner_prospects_rank():
+    """يُعيد ترتيب أولوية المُستهدَفين (يُكتب target_rank)."""
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    conn = get_db()
+    try:
+        with _book_lock:
+            n = rank_targets(conn)
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "ranked": n})
+
+
+# --------------------------------------------------------------------------- #
+# روابط عامّة للعميل: صفحة التقرير + تتبّع النقر (موقّعة برمز لكل عميل)          #
+# --------------------------------------------------------------------------- #
+def _public_base() -> str:
+    """رابط الموقع العام (لبناء روابط التقرير/التتبّع في الرسائل)."""
+    base = os.environ.get("BOOKING_PUBLIC_URL", "").strip()
+    if base:
+        return base.rstrip("/")
+    return request.host_url.rstrip("/")
+
+
+def _prospect_token(pid: int) -> str:
+    """رمز توقيع قصير لكل عميل (يمنع تخمين/تعداد روابط التقارير)."""
+    mac = hmac.new(app.secret_key.encode("utf-8") if isinstance(app.secret_key, str)
+                   else app.secret_key, f"report:{pid}".encode("utf-8"), hashlib.sha256)
+    return mac.hexdigest()[:16]
+
+
+def _check_token(pid: int, tok: str) -> bool:
+    return bool(tok) and secrets.compare_digest(_prospect_token(pid), str(tok))
+
+
+def report_link_for(pid: int) -> str:
+    return f"{_public_base()}/report/{pid}?t={_prospect_token(pid)}"
+
+
+_NEWSITE_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>عرض موقع + حجز واتساب — {name}</title>
+<style>
+body{{margin:0;font-family:Tahoma,Arial,sans-serif;background:#f1f5f9;color:#0f172a;line-height:1.8}}
+.wrap{{max-width:600px;margin:0 auto;padding:22px}}
+.top{{background:linear-gradient(135deg,#128C7E,#0d6e63);color:#fff;border-radius:18px;padding:26px;text-align:center}}
+.top h1{{margin:6px 0;font-size:24px}}
+.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:22px;margin-top:16px}}
+ul{{padding-inline-start:20px}} li{{margin:8px 0}}
+.btn{{display:block;text-align:center;background:#25D366;color:#053d2b;text-decoration:none;font-weight:800;
+font-size:18px;padding:15px;border-radius:14px;margin-top:18px}}
+</style></head><body><div class="wrap">
+<div class="top"><div>واجهة · عرض رقميّ</div><h1>{name}</h1>
+<div>موقع إلكترونيّ احترافيّ + حجز عبر واتساب يعمل ٢٤/٧</div></div>
+<div class="card"><h2>ماذا نقدّم لكم؟</h2><ul>{services}</ul></div>
+<a class="btn" href="{cta}">احجز استشارتك المجانية عبر واتساب</a>
+</div>{pixel}</body></html>"""
+
+
+@app.route("/report/<int:pid>")
+def public_report(pid):
+    """صفحة عامّة: تقرير تدقيق موقع العميل (أو عرض موقع جديد) — موقّعة برمز، مع تتبّع الفتح."""
+    if not _check_token(pid, request.args.get("t", "")):
+        abort(404)
+    conn = get_db()
+    try:
+        p = _get_prospect(conn, pid)
+        if not p:
+            abort(404)
+        prospect = _row_to_dict_safe(p)
+        with _book_lock:
+            record_open(conn, pid)   # فتح الصفحة = إشارة «اطّلع»
+            conn.commit()
+    finally:
+        conn.close()
+
+    pixel = f"{_public_base()}/api/track/open?id={pid}"
+    intl = (prospect.get("whatsapp") or "").strip()
+    wa_msg = f"السلام عليكم، بخصوص عرض «واجهة» لـ {prospect.get('name','منشأتنا')}"
+    wa_target = (f"https://wa.me/{intl}?text={quote(wa_msg)}" if intl
+                 else f"https://wa.me/?text={quote(wa_msg)}")
+    cta = f"{_public_base()}/go?pid={pid}&t={_prospect_token(pid)}&u={quote(wa_target, safe='')}"
+
+    site = (prospect.get("website") or "").strip()
+    if not site:
+        from offers import whatsbot_services
+        services = "".join(f"<li>{html_escape(s)}</li>" for s in whatsbot_services(prospect.get("category", "")))
+        return Response(_NEWSITE_HTML.format(
+            name=html_escape(prospect.get("name", "منشأتكم")), services=services,
+            cta=html_escape(cta), pixel=f'<img src="{html_escape(pixel)}" width="1" height="1" style="display:none">'),
+            mimetype="text/html")
+
+    # لديه موقع: تدقيق حيّ (مع تعويض من المخزّن عند الفشل) ثم تقرير كامل
+    au = audit_site(site)
+    if not au.get("ok") and prospect.get("audit_issues"):
+        au = {"url": site, "ok": True, "score": prospect.get("audit_score") or 0,
+              "dims": {}, "issues": (prospect.get("audit_issues") or "").split(" • "),
+              "strengths": (prospect.get("audit_strengths") or "").split(" • "),
+              "has_booking": False, "has_whatsapp": False, "https": site.startswith("https"),
+              "mobile": False, "title": "", "desc": ""}
+    business = {"name": prospect.get("name"), "phone": prospect.get("phone"),
+                "website": prospect.get("website")}
+    return Response(render_report(business, au, cta_url=cta, pixel_url=pixel),
+                    mimetype="text/html")
+
+
+def _row_to_dict_safe(row):
+    try:
+        return {k: row[k] for k in row.keys()}
+    except Exception:
+        return dict(row)
+
+
+@app.route("/go")
+def track_click():
+    """تتبّع نقر الرابط ثم إعادة التوجيه: ?pid=&t=&u=<urlencoded>."""
+    pid = request.args.get("pid")
+    tok = request.args.get("t", "")
+    url = request.args.get("u", "")
+    # السماح فقط بإعادة التوجيه لروابط http/https (منع open-redirect لمخططات أخرى)
+    valid = bool(re.match(r"^https?://", url, re.I))
+    if valid and pid and pid.isdigit() and _check_token(int(pid), tok):
+        conn = get_db()
+        try:
+            with _book_lock:
+                record_click(conn, int(pid))
+                conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    if not valid:
+        return redirect("/")
+    return redirect(url, code=302)
+
+
+@app.route("/api/owner/campaign/send", methods=["POST"])
+def owner_campaign_send():
+    """إرسال للمحدّدين من اللوحة: {ids:[...], channel:'whatsapp'|'email', offer:'report'|'newsite'}.
+
+    يبني رسالة فرديّة (تقرير الموقع أو عرض موقع جديد + خدمات whats_bot)، يرسلها عبر القناة،
+    ويحدّث حالة كل عميل إلى «أُرسل». يحترم الإرسال الفرديّ المهنيّ (PDPL).
+    """
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    ids = f.get("ids") or []
+    channel = (f.get("channel") or "whatsapp").lower()
+    offer = (f.get("offer") or "report").lower()
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"error": "لم تُحدَّد عملاء"}), 400
+    if channel not in ("whatsapp", "email"):
+        return jsonify({"error": "قناة غير مدعومة"}), 400
+
+    wa_client = None
+    if channel == "whatsapp":
+        if not _wasender_key():
+            return jsonify({"error": "مفتاح WaSenderAPI غير مضبوط على الخادم (WASENDER_API_KEY)"}), 400
+        try:
+            wa_client = WaSenderClient(min_interval=1.0, country="966")
+        except RuntimeError as e:
+            return jsonify({"error": str(e)}), 400
+    elif channel == "email" and not mailer.is_configured():
+        return jsonify({"error": "البريد غير مُعدّ على الخادم (BOOKING_SMTP_*)"}), 400
+
+    sent = failed = skipped = 0
+    details = []
+    conn = get_db()
+    try:
+        for raw in ids[:100]:
+            if not str(raw).isdigit():
+                continue
+            pid = int(raw)
+            p = _get_prospect(conn, pid)
+            if not p:
+                continue
+            prospect = _row_to_dict_safe(p)
+            # عرض «تقرير» لمن بلا موقع لا معنى له → حوّله لعرض موقع جديد تلقائياً
+            eff_offer = offer
+            if offer == "report" and not (prospect.get("website") or "").strip():
+                eff_offer = "newsite"
+            link = report_link_for(pid)
+            message = build_message(prospect, eff_offer, link)
+
+            if channel == "whatsapp":
+                e164 = to_e164(prospect.get("whatsapp") or prospect.get("phone"), "966")
+                if not e164:
+                    skipped += 1
+                    details.append({"id": pid, "skipped": "بلا واتساب"})
+                    continue
+                res = wa_client.send_text(e164, message)
+            else:
+                to = (prospect.get("email") or "").strip()
+                if not to:
+                    skipped += 1
+                    details.append({"id": pid, "skipped": "بلا إيميل"})
+                    continue
+                pixel = f"{_public_base()}/api/track/open?id={pid}&ch=email"
+                html_body = mailer.text_to_html(message, pixel_url=pixel, cta_url=link,
+                                                cta_label="شاهد العرض")
+                res = mailer.send_email(to, email_subject(prospect, eff_offer),
+                                        html=html_body, text=message)
+
+            if res.get("ok"):
+                sent += 1
+                with _book_lock:
+                    mark_sent(conn, pid, message[:300], link)
+                    conn.execute("UPDATE prospects SET channel=? WHERE id=?", (channel, pid))
+                    conn.commit()
+                details.append({"id": pid, "ok": True, "dry_run": res.get("dry_run", False)})
+            else:
+                failed += 1
+                details.append({"id": pid, "error": res.get("error", "")[:100]})
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "sent": sent, "failed": failed, "skipped": skipped,
+                    "channel": channel, "offer": offer, "details": details})
+
+
+def _followup_message(prospect: dict, link: str, opened: bool) -> str:
+    """رسالة متابعة لطيفة — أدفأ لمن فتح التقرير سابقًا."""
+    name = prospect.get("name") or "منشأتكم"
+    if opened:
+        return (f"مرحباً {name} 🙏\n"
+                f"لاحظنا اطّلاعكم على العرض — هل لديكم أي استفسار؟ يسعدنا تفعيله لكم "
+                f"خلال يوم واحد (موقع + حجز واتساب).\n{link}")
+    return (f"مرحباً {name} 👋\n"
+            f"تذكير لطيف بعرضنا: موقع احترافيّ + حجز عبر واتساب يعمل ٢٤/٧.\n"
+            f"يمكنكم الاطّلاع هنا: {link}\nمتى يناسبكم نشرحه باختصار؟")
+
+
+@app.route("/api/owner/followup/run", methods=["POST"])
+def owner_followup_run():
+    """متابعة آليّة من اللوحة: تُرسل تذكيرًا لمن «أُرسل» لهم ولم يردّوا (واتساب).
+
+    من ردّ (حالته ردّ/مهتم/عرض/عميل) لا تُتابَع. الجسم: {days:int=2} لتفادي التكرار اليوميّ.
+    """
+    if not is_owner():
+        return jsonify({"error": "غير مصرّح"}), 403
+    f = request.get_json(force=True, silent=True) or {}
+    try:
+        days = max(0, int(f.get("days", 2)))
+    except (TypeError, ValueError):
+        days = 2
+    if not _wasender_key():
+        return jsonify({"error": "مفتاح WaSenderAPI غير مضبوط على الخادم (WASENDER_API_KEY)"}), 400
+    try:
+        client = WaSenderClient(min_interval=1.0, country="966")
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 400
+
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    sent = skipped = failed = 0
+    conn = get_db()
+    try:
+        rows = list_prospects(conn, status="أُرسل")  # «ردّ» وما بعدها مستثناة تلقائيًّا
+        for p in rows:
+            lc = p.get("last_contacted_at") or ""
+            if days > 0 and lc and lc > cutoff:      # تواصلنا حديثًا → تخطّى
+                skipped += 1
+                continue
+            e164 = to_e164(p.get("whatsapp") or p.get("phone"), "966")
+            if not e164:
+                skipped += 1
+                continue
+            link = report_link_for(p["id"])
+            msg = _followup_message(p, link, bool(p.get("opens")))
+            res = client.send_text(e164, msg)
+            if res.get("ok"):
+                with _book_lock:
+                    mark_sent(conn, p["id"], msg[:300], link)
+                    conn.commit()
+                sent += 1
+            else:
+                failed += 1
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "sent": sent, "skipped": skipped, "failed": failed})
 
 
 @app.route("/owner/reports")
@@ -1024,20 +1474,190 @@ _PIXEL = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBR
 
 @app.route("/api/track/open")
 def track_open():
-    """بكسل تتبّع عام: ?fid=<feature_id> أو ?id=<n> → يزيد عدّاد فتح العميل."""
+    """بكسل تتبّع عام: ?fid=<feature_id> أو ?id=<n> → يزيد عدّاد الفتح.
+
+    ?ch=email يزيد عدّاد فتح الإيميل (email_opens) بدل فتح الصفحة (opens).
+    """
     fid = (request.args.get("fid") or "").strip()
     pid = request.args.get("id")
+    is_email = (request.args.get("ch") == "email")
     if fid or pid:
+        key = int(pid) if (pid and pid.isdigit()) else fid
         conn = get_db()
         try:
             with _book_lock:
-                record_open(conn, int(pid) if (pid and pid.isdigit()) else fid)
+                if is_email:
+                    record_email_open(conn, key)
+                else:
+                    record_open(conn, key)
                 conn.commit()
         except Exception:
             pass
         finally:
             conn.close()
     return Response(_PIXEL, mimetype="image/gif", headers={"Cache-Control": "no-store"})
+
+
+def _jid_digits(jid: str) -> str:
+    """يستخرج أرقام الهاتف من JID واتساب (9665xxxx@s.whatsapp.net) أو رقم عاديّ."""
+    s = str(jid or "")
+    s = s.split("@")[0].split(":")[0]
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def _match_prospect_id(conn, jid_or_phone: str):
+    """يطابق رقماً واردًا (intl/national) بعميل في القاعدة. يُعيد id أو None."""
+    d = _jid_digits(jid_or_phone)
+    if not d:
+        return None
+    cands = {d, "+" + d}
+    if d.startswith("966") and len(d) > 3:
+        cands.add("0" + d[3:])
+        cands.add(d[3:])
+    cands = list(cands)
+    ph = ",".join("?" * len(cands))
+    try:
+        row = conn.execute(
+            f"SELECT id FROM prospects WHERE whatsapp IN ({ph}) OR phone IN ({ph}) "
+            f"ORDER BY id LIMIT 1", tuple(cands) + tuple(cands)).fetchone()
+        return row["id"] if row else None
+    except Exception:
+        return None
+
+
+def _msg_text(msg: dict) -> str:
+    """يستخرج نصّ رسالة واردة من بنى Baileys الشائعة (best-effort)."""
+    m = (msg or {}).get("message") or {}
+    if isinstance(m, dict):
+        if m.get("conversation"):
+            return str(m["conversation"])[:300]
+        ext = m.get("extendedTextMessage") or {}
+        if isinstance(ext, dict) and ext.get("text"):
+            return str(ext["text"])[:300]
+        for k in ("imageMessage", "videoMessage", "documentMessage"):
+            cap = (m.get(k) or {}).get("caption") if isinstance(m.get(k), dict) else None
+            if cap:
+                return str(cap)[:300]
+    return str(msg.get("text") or msg.get("body") or "")[:300]
+
+
+def _parse_wasender_events(body: dict) -> list[dict]:
+    """يحوّل حمولة webhook (WaSenderAPI/Baileys أو شكل مسطّح) إلى أحداث موحّدة.
+
+    كل حدث: {phone, kind} حيث kind ∈ {reply, delivered, read}. متسامح مع عدّة صيَغ.
+    """
+    out: list[dict] = []
+    if not isinstance(body, dict):
+        return out
+    event = str(body.get("event") or body.get("type") or "").lower()
+    data = body.get("data", body)
+
+    def _status_kind(status):
+        s = str(status).lower()
+        if s in ("3", "delivery_ack", "delivered", "server_ack_delivered"):
+            return "delivered"
+        if s in ("4", "5", "read", "played", "read_ack"):
+            return "read"
+        if s in ("2", "server_ack", "sent"):
+            return "delivered"   # وصل للخادم — نعدّه تسليمًا تقريبيًّا
+        return None
+
+    # تمييز نوع الحدث بدقّة: تحديث حالة (update/ack/receipt) ≠ رسالة واردة (upsert/received)
+    is_status_event = ("update" in event or "ack" in event or "receipt" in event)
+    is_msg_event = (not is_status_event) and (
+        "upsert" in event or "received" in event or event in ("message", "messages"))
+
+    # 1) رسائل واردة (messages.upsert / received) — وليست تحديث حالة
+    msgs = None
+    if not is_status_event:
+        if isinstance(data, dict) and isinstance(data.get("messages"), list):
+            msgs = data["messages"]
+        elif is_msg_event:
+            if isinstance(data, list):
+                msgs = data
+            elif isinstance(data, dict) and data.get("key"):
+                msgs = [data]
+    if msgs:
+        for msg in msgs:
+            if not isinstance(msg, dict) or msg.get("update"):  # تجاهل عناصر تحديث الحالة
+                continue
+            key = msg.get("key") or {}
+            from_me = key.get("fromMe", msg.get("fromMe", False))
+            jid = key.get("remoteJid") or msg.get("from") or msg.get("remoteJid") or ""
+            phone = _jid_digits(jid)
+            if not phone:
+                continue
+            if not from_me:   # رسالة من العميل = ردّ
+                out.append({"phone": phone, "kind": "reply", "text": _msg_text(msg)})
+
+    # 2) تحديثات حالة (messages.update): تسليم/قراءة
+    updates = None
+    if is_status_event:
+        if isinstance(data, list):
+            updates = data
+        elif isinstance(data, dict):
+            updates = data.get("updates") if isinstance(data.get("updates"), list) else [data]
+    if updates:
+        for up in updates:
+            if not isinstance(up, dict):
+                continue
+            key = up.get("key") or {}
+            jid = key.get("remoteJid") or up.get("remoteJid") or up.get("to") or up.get("from") or ""
+            phone = _jid_digits(jid)
+            status = (up.get("update") or {}).get("status") if isinstance(up.get("update"), dict) else up.get("status")
+            kind = _status_kind(status)
+            if phone and kind:
+                out.append({"phone": phone, "kind": kind})
+
+    # 3) شكل مسطّح بسيط: {from, message|status}
+    if not out and isinstance(body, dict):
+        phone = _jid_digits(body.get("from") or body.get("phone") or "")
+        if phone:
+            if body.get("message") or body.get("text"):
+                out.append({"phone": phone, "kind": "reply", "text": _msg_text(body)})
+            else:
+                k = _status_kind(body.get("status"))
+                if k:
+                    out.append({"phone": phone, "kind": k})
+    return out
+
+
+@app.route("/api/wasender/webhook", methods=["POST"])
+def wasender_webhook():
+    """يستقبل أحداث WaSenderAPI: تسليم/قراءة + كشف الردّ آليًّا → يحدّث الـCRM.
+
+    الأمان: إن ضُبط WASENDER_WEBHOOK_SECRET يُطلب توقيع مطابق (ترويسة X-Webhook-Signature
+    أو معامل ?secret=). يُحدّث فقط عملاء موجودين مطابقين بالرقم.
+    إعداد الويبهوك في لوحة WaSenderAPI: {cloud}/api/wasender/webhook?secret=...
+    """
+    secret = os.environ.get("WASENDER_WEBHOOK_SECRET", "").strip()
+    if secret:
+        got = (request.headers.get("X-Webhook-Signature")
+               or request.headers.get("X-Webhook-Secret")
+               or request.args.get("secret", ""))
+        if not secrets.compare_digest(str(got), secret):
+            return jsonify({"error": "توقيع غير صالح"}), 403
+    body = request.get_json(force=True, silent=True) or {}
+    events = _parse_wasender_events(body)
+    replied = delivered = read = 0
+    conn = get_db()
+    try:
+        for ev in events:
+            pid = _match_prospect_id(conn, ev.get("phone", ""))
+            if not pid:
+                continue
+            with _book_lock:
+                if ev["kind"] == "reply":
+                    record_reply(conn, pid, ev.get("text")); replied += 1
+                elif ev["kind"] == "read":
+                    mark_read(conn, pid); read += 1
+                elif ev["kind"] == "delivered":
+                    mark_delivered(conn, pid); delivered += 1
+                conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "replied": replied, "delivered": delivered, "read": read,
+                    "events": len(events)})
 
 
 @app.route("/api/owner/prospects")
@@ -1439,22 +2059,82 @@ async function doImport(){
 
 
 CRM_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>المتابعة — CRM</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>الاستهداف والمتابعة</title>
 <style>""" + _BASE_CSS + """
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:16px}
-.kpi{background:#fff;border:1px solid #e3e8ee;border-radius:14px;padding:14px;text-align:center}
-.kpi b{display:block;font-size:24px;color:#128C7E}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202124;color:#fff;padding:10px 18px;border-radius:10px;display:none}
-select,input{padding:6px 8px;font-size:13px}
-.sc{display:inline-block;min-width:34px;text-align:center;padding:3px 8px;border-radius:20px;font-weight:700;color:#fff}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:14px}
+.kpi{background:#fff;border:1px solid #e3e8ee;border-radius:14px;padding:12px;text-align:center}
+.kpi b{display:block;font-size:22px;color:#128C7E}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#202124;color:#fff;padding:10px 18px;border-radius:10px;display:none;z-index:99}
+select,input{padding:6px 8px;font-size:13px;width:auto}
+.sc{display:inline-block;min-width:32px;text-align:center;padding:3px 8px;border-radius:20px;font-weight:700;color:#fff}
 .sc.lo{background:#ea4335}.sc.mid{background:#fbbc04;color:#202124}.sc.hi{background:#34a853}.sc.na{background:#9aa0a6}
-.act a,.act button{font-size:12px;padding:5px 9px;border-radius:7px;border:0;cursor:pointer;text-decoration:none;margin-inline-start:3px}
+.act a,.act button{font-size:12px;padding:5px 8px;border-radius:7px;border:0;cursor:pointer;text-decoration:none;margin-inline-start:3px}
 .act .au{background:#e7f7f0;color:#0c6b60}.act .wa{background:#25d366;color:#fff}.act .hb{background:#eef1f4;color:#3b4a5a}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.bar .btn{padding:8px 12px;font-size:13px}
+.tgt{color:#f59e0b;font-weight:800}.rank{display:inline-block;background:#128C7E;color:#fff;border-radius:6px;padding:1px 7px;font-size:12px;font-weight:700}
+.notes{max-width:230px;font-size:12px;color:#5b6b7b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.funnel{display:flex;gap:6px;flex-wrap:wrap;align-items:stretch;margin-bottom:6px}
+.fstep{flex:1;min-width:90px;background:#fff;border:1px solid #e3e8ee;border-radius:12px;padding:10px;text-align:center;position:relative}
+.fstep b{display:block;font-size:22px;color:#128C7E}.fstep span{font-size:12px;color:#7b8794}
+.fstep .pc{font-size:11px;color:#9aa5b1}
+.chips a{font-size:12px;padding:5px 10px;border-radius:20px;text-decoration:none;background:#eef1f4;color:#3b4a5a;margin-inline-start:4px}
+.chips a.on{background:#128C7E;color:#fff}
+td .mini{font-size:11px;color:#9aa5b1}
+.selbar{position:sticky;top:0;z-index:10;background:#0c6b60;color:#fff;border-radius:12px;padding:10px 14px;display:none;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.selbar .btn{padding:7px 11px;font-size:13px}
+.selbar select{color:#202124}
 </style></head><body><div class="wrap">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-  <h1>📇 المتابعة (CRM)</h1>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+  <h1>🎯 الاستهداف والمتابعة</h1>
   <div style="display:flex;gap:8px"><a class="btn" style="background:#e7f7f0;color:#0c6b60" href="/owner/reports">📊 التقارير</a>
   <a class="btn" style="background:#eef1f4;color:#3b4a5a" href="/owner">← اللوحة</a></div></div>
+
+<!-- القمع البصري -->
+<div class="card" style="padding:14px"><h2 style="margin-bottom:8px">قمع التحويل</h2>
+<div class="funnel">
+  {% set t=funnel.get('total',0) or 1 %}
+  <div class="fstep"><b>{{ funnel.get('total',0) }}</b><span>الإجمالي</span></div>
+  <div class="fstep"><b>{{ funnel.get('targets',0) }}</b><span>مُستهدَف</span></div>
+  <div class="fstep"><b>{{ funnel.get('sent',0) }}</b><span>أُرسل</span><div class="pc">{{ (100*funnel.get('sent',0)//t) }}%</div></div>
+  <div class="fstep"><b>{{ funnel.get('opened',0) }}</b><span>فُتح</span><div class="pc">{{ (100*funnel.get('opened',0)//t) }}%</div></div>
+  <div class="fstep"><b>{{ funnel.get('clicked',0) }}</b><span>نُقر الرابط</span><div class="pc">{{ (100*funnel.get('clicked',0)//t) }}%</div></div>
+  <div class="fstep"><b>{{ funnel.get('replied',0) }}</b><span>ردّ/مهتم</span><div class="pc">{{ (100*funnel.get('replied',0)//t) }}%</div></div>
+  <div class="fstep"><b>{{ funnel.get('customer',0) }}</b><span>عميل</span><div class="pc">{{ (100*funnel.get('customer',0)//t) }}%</div></div>
+</div></div>
+
+<div class="card" style="padding:14px"><h2>📥 استيراد عملاء محتملين</h2>
+  <p class="muted" style="font-size:13px;margin-bottom:6px">ارفع ملف JSON من السحب — يُحفظون للاستهداف (بلا تكرار). أو احفظ مباشرةً من أداة السحب.</p>
+  <input type="file" id="impf" accept=".json"><button class="btn p" onclick="doImport()">استيراد</button>
+  <span id="impr" class="muted"></span>
+</div>
+
+<!-- شريط الاختيار الجماعي (يظهر عند تحديد صفوف) -->
+<div class="selbar" id="selbar">
+  <strong><span id="selcount">0</span> محدّد</strong>
+  <button class="btn g" onclick="bulkAudit()">🔍 تدقيق المحدّدين</button>
+  <button class="btn p" onclick="bulkTarget(true)">⭐ أضِف للاستهداف</button>
+  <button class="btn" style="background:#fff3cd;color:#7a5b00" onclick="bulkTarget(false)">إزالة من الاستهداف</button>
+  <span style="border-inline-start:1px solid #ffffff55;padding-inline-start:10px">إرسال:</span>
+  <select id="channel"><option value="whatsapp">واتساب</option><option value="email">إيميل</option></select>
+  <select id="offer"><option value="report">تقرير موقعهم</option><option value="newsite">عرض موقع جديد + whats_bot</option></select>
+  <button class="btn g" onclick="bulkSend()">📤 إرسال للمحدّدين</button>
+</div>
+
+<!-- شريط الأدوات: الفرز/التصفية + إعادة الترتيب + المتابعة الآلية -->
+<div class="bar">
+  <span class="muted" style="font-size:13px">فرز:</span>
+  <span class="chips">
+    <a href="/owner/crm" class="{{ 'on' if not sort else '' }}">الأحدث</a>
+    <a href="/owner/crm?sort=score" class="{{ 'on' if sort=='score' else '' }}">الأدنى درجةً (الأكثر حاجة)</a>
+    <a href="/owner/crm?sort=rank{{ '&targets=1' if only_targets else '' }}" class="{{ 'on' if sort=='rank' else '' }}">ترتيب الاستهداف</a>
+    <a href="/owner/crm?sort=opens" class="{{ 'on' if sort=='opens' else '' }}">الأكثر تفاعلاً</a>
+    <a href="/owner/crm?targets=1{{ '&sort='+sort if sort else '' }}" class="{{ 'on' if only_targets else '' }}">⭐ المُستهدَفون فقط</a>
+  </span>
+  <span style="flex:1"></span>
+  <button class="btn" style="background:#e7f7f0;color:#0c6b60" onclick="reRank()">↕ إعادة ترتيب الأولوية</button>
+  <button class="btn" style="background:#eef1f4;color:#3b4a5a" onclick="runFollowup()">🔁 تشغيل المتابعة</button>
+</div>
 
 <div class="kpis">
   <div class="kpi"><b>{{ stats.values()|sum }}</b>الإجمالي</div>
@@ -1464,46 +2144,72 @@ select,input{padding:6px 8px;font-size:13px}
   <div class="kpi"><b>{{ stats.get('عميل',0) }}</b>عملاء</div>
 </div>
 
-<div class="card"><h2>📥 استيراد عملاء محتملين</h2>
-  <p class="muted" style="font-size:13px">ارفع ملف JSON من السحب — يُحفظون للمتابعة (بلا تكرار).</p>
-  <input type="file" id="impf" accept=".json"><button class="btn p" onclick="doImport()">استيراد</button>
-  <span id="impr" class="muted"></span>
-</div>
-
 <div class="card"><h2>العملاء ({{ prospects|length }})</h2>
-<table><thead><tr><th>المنشأة</th><th>الفئة</th><th>الموقع</th><th>درجة الموقع</th><th>الحالة</th><th>آخر تواصل</th><th>تفاعل</th><th>إجراءات</th></tr></thead><tbody>
+<table><thead><tr>
+  <th style="width:28px"><input type="checkbox" id="all" onclick="toggleAll(this)" style="width:auto"></th>
+  <th>المنشأة</th><th>الموقع</th><th>درجة</th><th>ملاحظات التدقيق</th><th>الحالة</th>
+  <th>تفاعل</th><th>استهداف</th><th>إجراءات</th>
+</tr></thead><tbody>
 {% for p in prospects %}
 <tr>
-  <td><strong>{{ p['name'] }}</strong></td>
-  <td class="muted">{{ p['category'] }}</td>
+  <td><input type="checkbox" class="rowchk" value="{{ p['id'] }}" onclick="updSel()" style="width:auto"></td>
+  <td><strong>{{ p['name'] }}</strong><div class="mini">{{ p['category'] }}{% if p['city'] %} · {{ p['city'] }}{% endif %}</div></td>
   <td>{% if p['website'] %}<a href="{{ p['website'] }}" target="_blank">موقع</a>{% else %}<span style="color:#ea4335">بلا موقع</span>{% endif %}</td>
   <td>{% set s=p['audit_score'] %}
     {% if s is none %}<span class="sc na">—</span>
     {% elif s>=70 %}<span class="sc hi">{{ s }}</span>
     {% elif s>=40 %}<span class="sc mid">{{ s }}</span>
     {% else %}<span class="sc lo">{{ s }}</span>{% endif %}</td>
+  <td><div class="notes" title="{{ p['audit_issues'] or '' }}">{{ p['audit_issues'] or '—' }}</div></td>
   <td><select id="st{{ p['id'] }}" data-id="{{ p['id'] }}" onchange="onStatus(this)">
     {% for st in statuses %}<option value="{{ st }}" {{ 'selected' if p['status']==st else '' }}>{{ st }}</option>{% endfor %}
-  </select></td>
-  <td class="muted" style="font-size:12px">{{ (p['last_contacted_at'] or '—')[:16] }}</td>
-  <td>{% if p['opens'] %}<span style="color:#137333;font-weight:700">👁 {{ p['opens'] }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+  </select><div class="mini">{{ (p['last_contacted_at'] or '')[:16] }}</div></td>
+  <td>
+    {% if p['opens'] %}<span style="color:#137333;font-weight:700" title="فتح الصفحة/التقرير">👁 {{ p['opens'] }}</span>{% endif %}
+    {% if p['clicks'] %}<span style="color:#1a73e8;font-weight:700" title="نقر الرابط"> 🔗 {{ p['clicks'] }}</span>{% endif %}
+    {% if p['read_at'] %}<span title="قرأ الواتساب">✓✓</span>{% endif %}
+    {% if not p['opens'] and not p['clicks'] and not p['read_at'] %}<span class="muted">—</span>{% endif %}
+  </td>
+  <td>{% if p['is_target'] %}<span class="tgt" title="مُستهدَف">★</span>{% if p['target_rank'] %} <span class="rank">#{{ p['target_rank'] }}</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
   <td class="act">
-    <a class="au" href="/owner/prospect/{{ p['id'] }}/audit" target="_blank">🔍 تدقيق</a>
+    <a class="au" href="/owner/prospect/{{ p['id'] }}/audit" target="_blank">🔍</a>
     {% if p['whatsapp'] %}<a class="wa" href="https://wa.me/{{ p['whatsapp'] }}" target="_blank">واتساب</a>{% endif %}
     <button class="hb" onclick="handoff({{ p['id'] }})">whats_bot</button>
   </td>
 </tr>
-{% else %}<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">لا يوجد عملاء بعد. استورد ملف السحب بالأعلى.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">لا يوجد عملاء بعد. احفظ من أداة السحب أو استورد ملف JSON بالأعلى.</td></tr>{% endfor %}
 </tbody></table></div></div>
 <div class="toast" id="toast"></div>
 <script>
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',1500);}
-function setStatus(id,status,notes){
-  fetch('/api/owner/prospect/'+id+'/status',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({status:status,notes:notes})}).then(r=>r.json()).then(d=>toast(d.ok?'حُفظ ✓':('خطأ: '+(d.error||''))));
-}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',2200);}
+function selectedIds(){return Array.from(document.querySelectorAll('.rowchk:checked')).map(c=>parseInt(c.value));}
+function updSel(){const n=selectedIds().length;document.getElementById('selcount').textContent=n;
+  document.getElementById('selbar').style.display=n?'flex':'none';}
+function toggleAll(cb){document.querySelectorAll('.rowchk').forEach(c=>c.checked=cb.checked);updSel();}
+function need(ids){if(!ids.length){toast('حدّد عملاء أولاً');return false;}return true;}
+async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return {ok:r.ok,d:await r.json().catch(()=>({}))};}
+async function bulkAudit(){const ids=selectedIds();if(!need(ids))return;toast('جارٍ تدقيق '+ids.length+'…');
+  const {ok,d}=await post('/api/owner/prospects/audit',{ids});
+  toast(ok?('دُقّق '+d.audited+' · بلا موقع '+d.no_site+(d.failed?(' · فشل '+d.failed):'')):'خطأ');
+  if(ok)setTimeout(()=>location.reload(),1100);}
+async function bulkTarget(on){const ids=selectedIds();if(!need(ids))return;
+  const {ok,d}=await post('/api/owner/prospects/target',{ids,on});
+  toast(ok?((on?'أُضيف للاستهداف ':'أُزيل ')+d.updated):'خطأ');if(ok)setTimeout(()=>location.reload(),800);}
+async function reRank(){const {ok,d}=await post('/api/owner/prospects/rank',{});toast(ok?('رُتّب '+d.ranked+' مُستهدَف'):'خطأ');if(ok)setTimeout(()=>location.reload(),800);}
+async function bulkSend(){const ids=selectedIds();if(!need(ids))return;
+  const channel=document.getElementById('channel').value, offer=document.getElementById('offer').value;
+  if(!confirm('إرسال '+(offer==='report'?'تقرير الموقع':'عرض موقع جديد + whats_bot')+' عبر '+(channel==='email'?'الإيميل':'الواتساب')+' إلى '+ids.length+' عميلاً؟'))return;
+  toast('جارٍ الإرسال…');
+  const {ok,d}=await post('/api/owner/campaign/send',{ids,channel,offer});
+  toast(ok?('أُرسل '+d.sent+(d.failed?(' · فشل '+d.failed):'')+(d.skipped?(' · تخطّي '+d.skipped):'')):('خطأ: '+(d.error||'')));
+  if(ok)setTimeout(()=>location.reload(),1300);}
+async function runFollowup(){if(!confirm('إرسال رسالة متابعة لمن أُرسل لهم ولم يردّوا (واتساب)؟'))return;toast('جارٍ المتابعة…');
+  const {ok,d}=await post('/api/owner/followup/run',{});
+  toast(ok?('تابعنا '+d.sent+' عميلاً'+(d.skipped?(' · تخطّي '+d.skipped):'')):('خطأ: '+(d.error||'')));
+  if(ok)setTimeout(()=>location.reload(),1200);}
+function setStatus(id,status,notes){post('/api/owner/prospect/'+id+'/status',{status,notes}).then(({d})=>toast(d.ok?'حُفظ ✓':('خطأ: '+(d.error||''))));}
 function onStatus(sel){setStatus(sel.dataset.id,sel.value,null);}
-function handoff(id){fetch('/api/owner/prospect/'+id+'/handoff',{method:'POST'}).then(r=>r.json()).then(d=>toast(d.note||d.action||'تم التسليم'));}
+function handoff(id){post('/api/owner/prospect/'+id+'/handoff',{}).then(({d})=>toast(d.note||d.action||'تم التسليم'));}
 async function doImport(){
   const f=document.getElementById('impf').files[0]; if(!f){alert('اختر ملف JSON');return;}
   const fd=new FormData(); fd.append('file',f);

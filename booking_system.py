@@ -521,7 +521,8 @@ def home():
 def health():
     """فحص صحّة + نوع قاعدة البيانات (دون كشف أي أسرار)."""
     backend = "turso" if os.environ.get("TURSO_DATABASE_URL") else "sqlite"
-    info = {"backend": backend, "has_token": bool(os.environ.get("TURSO_AUTH_TOKEN"))}
+    info = {"backend": backend, "has_token": bool(os.environ.get("TURSO_AUTH_TOKEN")),
+            "commit": (os.environ.get("RENDER_GIT_COMMIT") or "local")[:7]}
     try:
         conn = get_db()
         conn.execute("SELECT 1").fetchone()

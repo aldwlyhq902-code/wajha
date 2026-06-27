@@ -1669,9 +1669,13 @@ def wasender_webhook():
     إعداد الويبهوك في لوحة WaSenderAPI: Payload URL = {cloud}/api/wasender/webhook
     """
     raw = request.get_data() or b""
-    if not _verify_wasender_sig(raw):
+    raw_text = raw.decode("utf-8", "replace")
+    sig_ok = _verify_wasender_sig(raw)
+    if not sig_ok:
+        _log_webhook(raw_text, False, 0, 0, "")
         return jsonify({"error": "توقيع غير صالح"}), 403
     body = request.get_json(force=True, silent=True) or {}
+    event_name = str(body.get("event") or body.get("type") or "") if isinstance(body, dict) else ""
     events = _parse_wasender_events(body)
     replied = delivered = read = 0
     conn = get_db()
@@ -1690,8 +1694,53 @@ def wasender_webhook():
                 conn.commit()
     finally:
         conn.close()
+    _log_webhook(raw_text, True, len(events), replied + delivered + read, event_name)
     return jsonify({"ok": True, "replied": replied, "delivered": delivered, "read": read,
                     "events": len(events)})
+
+
+def _log_webhook(raw_text, sig_ok, n_events, n_matched, event_name):
+    """التقاط مؤقّت لآخر ٢٠ حمولة ويبهوك (لتشخيص شكل أحداث الردّ الواردة)."""
+    try:
+        conn = get_db()
+        with _book_lock:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS webhook_log ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, sig_ok INTEGER,"
+                " event_name TEXT, events INTEGER, matched INTEGER, raw TEXT)")
+            conn.execute(
+                "INSERT INTO webhook_log(ts,sig_ok,event_name,events,matched,raw) VALUES(?,?,?,?,?,?)",
+                (datetime.now().isoformat(timespec="seconds"), 1 if sig_ok else 0,
+                 (event_name or "")[:80], n_events, n_matched, (raw_text or "")[:4000]))
+            conn.execute(
+                "DELETE FROM webhook_log WHERE id NOT IN "
+                "(SELECT id FROM webhook_log ORDER BY id DESC LIMIT 20)")
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+@app.route("/api/owner/webhook-debug")
+def owner_webhook_debug():
+    """آخر حمولات الويبهوك (لتشخيص أحداث الردّ). مالك أو X-Owner-Key."""
+    if not (is_owner() or _verify_owner_pw((request.headers.get("X-Owner-Key") or "").strip())):
+        return jsonify({"error": "غير مصرّح"}), 403
+    conn = get_db()
+    out = []
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS webhook_log ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, sig_ok INTEGER,"
+            " event_name TEXT, events INTEGER, matched INTEGER, raw TEXT)")
+        rows = conn.execute(
+            "SELECT ts,sig_ok,event_name,events,matched,raw FROM webhook_log "
+            "ORDER BY id DESC LIMIT 20").fetchall()
+        out = [{"ts": r["ts"], "sig_ok": r["sig_ok"], "event_name": r["event_name"],
+                "events": r["events"], "matched": r["matched"], "raw": r["raw"]} for r in rows]
+    finally:
+        conn.close()
+    return jsonify({"count": len(out), "log": out})
 
 
 @app.route("/api/owner/prospects")

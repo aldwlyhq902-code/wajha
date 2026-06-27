@@ -96,6 +96,8 @@ def ensure_prospects_table(conn) -> None:
         " report_url TEXT,"
         " notes TEXT,"
         " last_contacted_at TEXT,"
+        " opens INTEGER DEFAULT 0,"
+        " last_open_at TEXT,"
         " created_at TEXT,"
         " updated_at TEXT"
         ")"
@@ -106,6 +108,37 @@ def ensure_prospects_table(conn) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_prospects_status ON prospects(status)"
     )
+    # ترحيل الجداول القديمة: أضِف أعمدة تتبّع الفتح إن غابت
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(prospects)").fetchall()}
+        if "opens" not in cols:
+            conn.execute("ALTER TABLE prospects ADD COLUMN opens INTEGER DEFAULT 0")
+        if "last_open_at" not in cols:
+            conn.execute("ALTER TABLE prospects ADD COLUMN last_open_at TEXT")
+    except Exception:
+        pass
+
+
+def record_open(conn, key) -> bool:
+    """يزيد عدّاد فتح التقرير/الصفحة لعميل (مطابقة بـ id أو feature_id أو phone)."""
+    now = _now()
+    target_id = None
+    if isinstance(key, int):
+        row = conn.execute("SELECT id FROM prospects WHERE id=? LIMIT 1", (key,)).fetchone()
+        if row is not None:
+            target_id = row["id"]
+    else:
+        skey = (str(key).strip() if key is not None else "") or None
+        ex = _find_existing(conn, skey, skey)
+        if ex is not None:
+            target_id = ex["id"]
+    if target_id is None:
+        return False
+    conn.execute(
+        "UPDATE prospects SET opens=COALESCE(opens,0)+1, last_open_at=?, updated_at=? WHERE id=?",
+        (now, now, target_id),
+    )
+    return True
 
 
 # --------------------------------------------------------------------------- #

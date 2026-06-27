@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
@@ -48,7 +49,7 @@ from flask import (
 from leads import normalize_phone, whatsappable, load_records
 
 # وحدات منصّة النمو (بُنيت متوازية): CRM، تدقيق المواقع، التسعير، التقارير، جسر whats_bot
-from crm import (ensure_prospects_table, upsert_prospect, mark_sent,
+from crm import (ensure_prospects_table, upsert_prospect, mark_sent, record_open,
                  set_status as crm_set_status, list_prospects, stats_by_status, STATUSES)
 from audit import audit_site, render_report
 from pricing import suggest_plan
@@ -1017,6 +1018,42 @@ def crm_record():
     return jsonify({"ok": True, "id": p.get("id")})
 
 
+# بكسل شفّاف 1×1 لرصد فتح صفحة/تقرير العميل
+_PIXEL = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+
+
+@app.route("/api/track/open")
+def track_open():
+    """بكسل تتبّع عام: ?fid=<feature_id> أو ?id=<n> → يزيد عدّاد فتح العميل."""
+    fid = (request.args.get("fid") or "").strip()
+    pid = request.args.get("id")
+    if fid or pid:
+        conn = get_db()
+        try:
+            with _book_lock:
+                record_open(conn, int(pid) if (pid and pid.isdigit()) else fid)
+                conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    return Response(_PIXEL, mimetype="image/gif", headers={"Cache-Control": "no-store"})
+
+
+@app.route("/api/owner/prospects")
+def api_owner_prospects():
+    """قائمة العملاء JSON (لجلسة المالك أو لأداة المتابعة عبر X-Owner-Key)."""
+    if not (is_owner() or _verify_owner_pw((request.headers.get("X-Owner-Key") or "").strip())):
+        return jsonify({"error": "غير مصرّح"}), 403
+    conn = get_db()
+    try:
+        rows = list_prospects(conn, status=request.args.get("status") or None,
+                              q=request.args.get("q") or None)
+    finally:
+        conn.close()
+    return jsonify({"prospects": rows})
+
+
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
@@ -1434,7 +1471,7 @@ select,input{padding:6px 8px;font-size:13px}
 </div>
 
 <div class="card"><h2>العملاء ({{ prospects|length }})</h2>
-<table><thead><tr><th>المنشأة</th><th>الفئة</th><th>الموقع</th><th>درجة الموقع</th><th>الحالة</th><th>آخر تواصل</th><th>إجراءات</th></tr></thead><tbody>
+<table><thead><tr><th>المنشأة</th><th>الفئة</th><th>الموقع</th><th>درجة الموقع</th><th>الحالة</th><th>آخر تواصل</th><th>تفاعل</th><th>إجراءات</th></tr></thead><tbody>
 {% for p in prospects %}
 <tr>
   <td><strong>{{ p['name'] }}</strong></td>
@@ -1449,13 +1486,14 @@ select,input{padding:6px 8px;font-size:13px}
     {% for st in statuses %}<option value="{{ st }}" {{ 'selected' if p['status']==st else '' }}>{{ st }}</option>{% endfor %}
   </select></td>
   <td class="muted" style="font-size:12px">{{ (p['last_contacted_at'] or '—')[:16] }}</td>
+  <td>{% if p['opens'] %}<span style="color:#137333;font-weight:700">👁 {{ p['opens'] }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
   <td class="act">
     <a class="au" href="/owner/prospect/{{ p['id'] }}/audit" target="_blank">🔍 تدقيق</a>
     {% if p['whatsapp'] %}<a class="wa" href="https://wa.me/{{ p['whatsapp'] }}" target="_blank">واتساب</a>{% endif %}
     <button class="hb" onclick="handoff({{ p['id'] }})">whats_bot</button>
   </td>
 </tr>
-{% else %}<tr><td colspan="7" class="muted" style="text-align:center;padding:24px">لا يوجد عملاء بعد. استورد ملف السحب بالأعلى.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">لا يوجد عملاء بعد. استورد ملف السحب بالأعلى.</td></tr>{% endfor %}
 </tbody></table></div></div>
 <div class="toast" id="toast"></div>
 <script>

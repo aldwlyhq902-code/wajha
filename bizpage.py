@@ -142,10 +142,15 @@ footer a{color:var(--brand);font-weight:700}
 </div>
 
 <footer>هذه الصفحة مقدّمة بـ <a href="#">واجهة</a> — واتساب ذكي وحجز إلكتروني للمنشآت.</footer>
+%%PIXEL%%
 </body></html>"""
 
+# الرابط الافتراضي للوحة السحابية (لبكسل رصد فتح الصفحة)
+CLOUD_DEFAULT = "https://booking-system-y5id.onrender.com"
 
-def render_business_page(r: dict, country: str = "966", brand: str = "واجهة") -> str:
+
+def render_business_page(r: dict, country: str = "966", brand: str = "واجهة",
+                         track_url: str = "") -> str:
     name = r.get("name", "")
     intl = normalize_phone(r.get("phone"), country)
     can_wa = bool(intl and whatsappable(intl, r.get("phone"), country))
@@ -180,13 +185,17 @@ def render_business_page(r: dict, country: str = "966", brand: str = "واجهة
         hours_html = "<li><span>اتصل لمعرفة الأوقات</span><span></span></li>"
 
     reviews = f"({r.get('reviews_count')} تقييم)" if r.get("reviews_count") else ""
+    fid = feature_id(r.get("place_url", ""))
+    pixel = (f'<img src="{_e(track_url.rstrip("/"))}/api/track/open?fid={_e(fid)}" '
+             f'width="1" height="1" alt="" style="position:absolute;left:-9999px;top:auto">'
+             if (track_url and fid) else "")
     repl = {
         "%%NAME%%": _e(name), "%%CATEGORY%%": _e(r.get("category", "")),
         "%%STARS%%": stars_html(r.get("rating")), "%%RATING%%": _e(r.get("rating")) if r.get("rating") else "",
         "%%REVIEWS%%": _e(reviews), "%%HEROBG%%": herobg, "%%WA%%": _e(wa),
         "%%CALL%%": call, "%%MAPBTN%%": mapbtn, "%%MAP%%": mapembed,
         "%%ADDRESS%%": _e(r.get("address", "")) or "—",
-        "%%CHIPS%%": chips, "%%HOURS%%": hours_html,
+        "%%CHIPS%%": chips, "%%HOURS%%": hours_html, "%%PIXEL%%": pixel,
     }
     out = PAGE
     for k, v in repl.items():
@@ -194,7 +203,8 @@ def render_business_page(r: dict, country: str = "966", brand: str = "واجهة
     return out
 
 
-def build(records, outdir="landing/sites", country="966", brand="واجهة", base_url="") -> list[dict]:
+def build(records, outdir="landing/sites", country="966", brand="واجهة",
+          base_url="", track_url="") -> list[dict]:
     out = Path(outdir)
     if out.exists():
         shutil.rmtree(out, ignore_errors=True)
@@ -208,7 +218,8 @@ def build(records, outdir="landing/sites", country="966", brand="واجهة", ba
             continue
         seen.add(pid)
         (out / pid).mkdir(parents=True, exist_ok=True)
-        (out / pid / "index.html").write_text(render_business_page(r, country, brand), encoding="utf-8")
+        (out / pid / "index.html").write_text(
+            render_business_page(r, country, brand, track_url), encoding="utf-8")
         url = (base_url.rstrip("/") + "/" + pid + "/") if base_url else ""
         rows.append({"name": r.get("name", ""), "phone": r.get("phone", ""),
                      "feature_id": feature_id(r.get("place_url", "")), "pid": pid, "url": url})
@@ -244,13 +255,15 @@ def main() -> None:
     ap.add_argument("--brand", default="واجهة")
     ap.add_argument("--outdir", "-o", default="landing/sites")
     ap.add_argument("--base-url", default="")
+    ap.add_argument("--track-url", default=CLOUD_DEFAULT,
+                    help="رابط اللوحة لبكسل رصد فتح الصفحة (فارغ=تعطيل)")
     args = ap.parse_args()
 
     records = load_records(args.input)
     if not records:
         print("❌ لا توجد بيانات. اسحب أولاً (run.py / pipeline.py).")
         sys.exit(1)
-    rows = build(records, args.outdir, args.country, args.brand, args.base_url)
+    rows = build(records, args.outdir, args.country, args.brand, args.base_url, args.track_url)
     print("=" * 56)
     print(f" 🌐 تم توليد {len(rows)} صفحة منشأة في: {args.outdir}")
     print(f" روابط: output/bizpages_links.csv")

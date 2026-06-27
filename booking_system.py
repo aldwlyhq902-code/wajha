@@ -992,6 +992,31 @@ def owner_prospect_handoff(pid):
     return jsonify(handoff_prospect({"name": p["name"], "phone": p["phone"], "category": p["category"]}))
 
 
+@app.route("/api/crm/record", methods=["POST"])
+def crm_record():
+    """تسجيل إرسال من send_campaign محلياً إلى الـCRM السحابي (مصادقة بترويسة X-Owner-Key)."""
+    if not _verify_owner_pw((request.headers.get("X-Owner-Key") or "").strip()):
+        return jsonify({"error": "غير مصرّح"}), 403
+    d = request.get_json(force=True, silent=True) or {}
+    if not isinstance(d, dict) or not d.get("name"):
+        return jsonify({"error": "بيانات غير صالحة"}), 400
+    intl = normalize_phone(d.get("phone"), "966")
+    wa = intl if (intl and whatsappable(intl, d.get("phone"), "966")) else ""
+    conn = get_db()
+    try:
+        with _book_lock:
+            p = upsert_prospect(conn, {
+                "feature_id": d.get("feature_id", ""), "name": d.get("name", ""),
+                "phone": d.get("phone", ""), "whatsapp": wa, "category": d.get("category", ""),
+                "website": d.get("website", ""), "source": d.get("source", "حملة"),
+            })
+            mark_sent(conn, p["id"], (d.get("message") or "أُرسلت رسالة")[:300], d.get("report_url"))
+            conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "id": p.get("id")})
+
+
 # --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #

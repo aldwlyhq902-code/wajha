@@ -1602,10 +1602,20 @@ def _parse_wasender_events(body: dict) -> list[dict]:
             if not isinstance(up, dict):
                 continue
             key = up.get("key") or {}
-            jid = key.get("remoteJid") or up.get("remoteJid") or up.get("to") or up.get("from") or ""
+            jid = (key.get("remoteJid") or up.get("remoteJid") or up.get("jid")
+                   or up.get("to") or up.get("from") or "")
             phone = _jid_digits(jid)
             status = (up.get("update") or {}).get("status") if isinstance(up.get("update"), dict) else up.get("status")
             kind = _status_kind(status)
+            # حدث message-receipt.update يحمل receipt بطوابع قراءة/تسليم بدل status
+            if not kind:
+                rc = up.get("receipt") or up.get("update") or {}
+                if isinstance(rc, dict):
+                    if rc.get("readTimestamp") or rc.get("readTimestampMs") or rc.get("read"):
+                        kind = "read"
+                    elif (rc.get("receiptTimestamp") or rc.get("deliveryTimestamp")
+                          or rc.get("delivered")):
+                        kind = "delivered"
             if phone and kind:
                 out.append({"phone": phone, "kind": kind})
 
@@ -1622,21 +1632,45 @@ def _parse_wasender_events(body: dict) -> list[dict]:
     return out
 
 
+def _verify_wasender_sig(raw_body: bytes) -> bool:
+    """تحقّق متين من توقيع ويبهوك WaSenderAPI.
+
+    يقبل أيًّا ممّا يلي مطابقًا لـ WASENDER_WEBHOOK_SECRET:
+      • النصّ الخام في ترويسة X-Webhook-Signature أو X-Webhook-Secret أو معامل ?secret=
+      • توقيع HMAC-SHA256 (hex، مع/بدون بادئة sha256=) للجسم الخام في X-Webhook-Signature
+    إن لم يُضبط السرّ → يُقبل (مفتوح، لكن يُحدّث فقط أرقامًا موجودة).
+    """
+    secret = os.environ.get("WASENDER_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        return True
+    sig = (request.headers.get("X-Webhook-Signature") or "").strip()
+    sec_hdr = (request.headers.get("X-Webhook-Secret") or "").strip()
+    q = (request.args.get("secret") or "").strip()
+    # 1) مطابقة نصّ خام (ترويسة أو معامل)
+    for cand in (sig, sec_hdr, q):
+        if cand and secrets.compare_digest(cand, secret):
+            return True
+    # 2) توقيع HMAC-SHA256 للجسم
+    if sig:
+        mac = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+        s = sig.split("=", 1)[1] if sig.lower().startswith("sha256=") else sig
+        if secrets.compare_digest(s.lower(), mac.lower()):
+            return True
+    return False
+
+
 @app.route("/api/wasender/webhook", methods=["POST"])
 def wasender_webhook():
     """يستقبل أحداث WaSenderAPI: تسليم/قراءة + كشف الردّ آليًّا → يحدّث الـCRM.
 
-    الأمان: إن ضُبط WASENDER_WEBHOOK_SECRET يُطلب توقيع مطابق (ترويسة X-Webhook-Signature
-    أو معامل ?secret=). يُحدّث فقط عملاء موجودين مطابقين بالرقم.
-    إعداد الويبهوك في لوحة WaSenderAPI: {cloud}/api/wasender/webhook?secret=...
+    الأمان: إن ضُبط WASENDER_WEBHOOK_SECRET يُتحقَّق من ترويسة X-Webhook-Signature
+    (نصّ خام أو توقيع HMAC-SHA256 للجسم) أو ترويسة X-Webhook-Secret أو معامل ?secret=.
+    يُحدّث فقط عملاء موجودين مطابقين بالرقم.
+    إعداد الويبهوك في لوحة WaSenderAPI: Payload URL = {cloud}/api/wasender/webhook
     """
-    secret = os.environ.get("WASENDER_WEBHOOK_SECRET", "").strip()
-    if secret:
-        got = (request.headers.get("X-Webhook-Signature")
-               or request.headers.get("X-Webhook-Secret")
-               or request.args.get("secret", ""))
-        if not secrets.compare_digest(str(got), secret):
-            return jsonify({"error": "توقيع غير صالح"}), 403
+    raw = request.get_data() or b""
+    if not _verify_wasender_sig(raw):
+        return jsonify({"error": "توقيع غير صالح"}), 403
     body = request.get_json(force=True, silent=True) or {}
     events = _parse_wasender_events(body)
     replied = delivered = read = 0
